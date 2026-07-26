@@ -73,7 +73,8 @@ def main():
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    entries = [json.loads(l) for l in open(args.links, encoding="utf-8")]
+    # utf-8-sig, in case the manifest was round-tripped through a Windows editor
+    entries = [json.loads(l) for l in open(args.links, encoding="utf-8-sig")]
     if args.only:
         entries = [e for e in entries if e["video_id"] == args.only]
         if not entries:

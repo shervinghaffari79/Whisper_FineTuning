@@ -66,7 +66,7 @@ def parse_srt(path: Path):
 
 def parse_json(path: Path):
     """youtube_transcript_api JSONFormatter output: [{text, start, duration}]."""
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8-sig"))  # tolerate a BOM
     if not isinstance(data, list):
         raise ValueError("expected a JSON list of {text, start, duration}")
     for cue in data:

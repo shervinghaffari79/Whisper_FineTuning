@@ -47,7 +47,11 @@ def derive_id(url: str) -> str:
 
 def read_urls(path: Path):
     entries = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig: a urls.txt saved by a Windows editor carries a BOM, and it
+    # would otherwise ride along inside the first entry's audio_url as an
+    # invisible ﻿ -- the printed id table looks correct and sm_02 then
+    # fetches a URL the host has never heard of
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue

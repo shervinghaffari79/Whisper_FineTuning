@@ -158,6 +158,10 @@ def main():
         transcripts = [t for t in transcripts if t.stem == args.only]
         if not transcripts:
             sys.exit(f"no transcript for {args.only} in {tr_dir} or {val_dir}")
+        # --only builds a single video, so a val/ dir naming OTHER videos can
+        # never contribute clips. Drop it and let the single-video tail-slice
+        # fallback below apply, rather than failing on an empty val split.
+        dir_val_ids &= {t.stem for t in transcripts}
 
     rows, stats = [], []
     for tr_path in transcripts:
@@ -222,7 +226,15 @@ def main():
         if missing:
             sys.exit(f"--val-videos names ids with no clips: {missing}\n"
                      f"available: {videos}")
-        val_videos &= set(videos)  # a val transcript whose audio never downloaded
+        # a val transcript whose audio never downloaded produces no clips; drop
+        # it, but say so -- silently shrinking the validation set is how you end
+        # up comparing WER against a different held-out population than you think
+        dropped = sorted(val_videos - set(videos))
+        if dropped:
+            print(f"WARNING: validation transcripts with no clips, excluded: {dropped}\n"
+                  f"         (their audio is missing from {audio_dir} or produced no "
+                  f"usable segments)", file=sys.stderr)
+        val_videos &= set(videos)
         if not val_videos:
             sys.exit("no validation clips were produced -- check that the audio for the "
                      f"transcripts in {val_dir} downloaded and decoded")
