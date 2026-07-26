@@ -1,0 +1,12 @@
+.venv-finetune/
+runs/
+run_smoke/
+sm_data/
+data/
+__pycache__/
+*.pyc
+*.wav
+*.m4a
+*.env
+__MACOSX/
+.DS_Store 

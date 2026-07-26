@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+Local Persian ASR pipeline for the web backend.
+
+Best deployable setup from the research/experiments, using the WhisperX-style
+"transcribe and diarize independently, then assign speakers by overlap" design
+so we get both good WER and good speaker labels:
+
+  ffmpeg 16k mono
+    ├─ Silero VAD -> ~24s chunks -> Whisper large-v3 (fa) [+ word times]
+    └─ pyannote 3.1 speaker diarization (neural segmentation + WeSpeaker embeds)
+  -> assign each word/segment the speaker whose turn it overlaps most
+  -> Hazm Persian normalization
+
+The actual Whisper inference is delegated to asr_engine.py, which picks
+between MLX (Apple-Silicon GPU) and CTranslate2/faster-whisper (CUDA/CPU,
+cross-platform) automatically -- see that module for details.
+
+pyannote 3.1 is gated: it needs a Hugging Face token (cached via
+`huggingface_hub login`) with the model's user conditions accepted. If it is
+unavailable, the pipeline degrades to a lightweight resemblyzer clustering and,
+failing that, a single speaker -- transcription still works either way.
+
+An optional `correct_fn(text, speaker, context) -> text` hook (see correct.py)
+can be supplied to lightly clean up each segment's text right after it is
+produced, before it is streamed to the client or included in the final result.
+"""
+import os
+import subprocess
+import sys
+import time
+import types
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+SAMPLE_RATE = 16000
+DIARIZER = os.environ.get("DIARIZER", "pyannote")  # "pyannote" | "resemblyzer" | "off"
+
+
+def model_dir() -> Path:
+    """Best-guess directory of the ASR model that will be used -- mirrors
+    asr_engine's auto-detection but WITHOUT forcing a (possibly heavy) model
+    load, so a health check stays cheap. See asr_engine.py for the real
+    selection used at transcribe time."""
+    import asr_engine
+    requested = os.environ.get("ASR_BACKEND", "auto").lower()
+    if requested in ("mlx", "auto") and asr_engine.MLX_MODEL_DIR.exists():
+        try:
+            import mlx_whisper  # noqa: F401 -- availability probe only
+            return asr_engine.MLX_MODEL_DIR
+        except Exception:
+            pass
+    return asr_engine.CT2_MODEL_DIR
+
+
+def model_available() -> bool:
+    import asr_engine
+    return asr_engine.MLX_MODEL_DIR.exists() or asr_engine.CT2_MODEL_DIR.exists()
+
+
+_ENCODER = None
+_NORMALIZER = None
+_PYANNOTE = None
+_PYANNOTE_TRIED = False
+
+
+def _log(msg, cb=None):
+    if cb:
+        cb(msg)
+
+
+def decode_audio(path: str) -> np.ndarray:
+    """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
+    cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
+           "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-"]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')[-300:]}")
+    if len(proc.stdout) == 0:
+        # ffmpeg can exit 0 while decoding zero frames -- e.g. a container with a
+        # truncated/corrupted sample-index atom (seen with some phone recordings
+        # interrupted mid-save). Surface this as a real error instead of silently
+        # producing an empty "done" transcription.
+        stderr = proc.stderr.decode("utf-8", "ignore")
+        hint = ""
+        if "truncated" in stderr.lower() or "moov atom not found" in stderr.lower():
+            hint = " The file's internal index looks corrupted/incomplete (interrupted recording or transfer)."
+        raise RuntimeError(f"No audio could be decoded from this file.{hint} ffmpeg said: "
+                          f"{stderr[-300:]}")
+    return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
+
+
+# ── speech segmentation for transcription ──────────────────────────────────
+
+def _vad_segments(audio):
+    from silero_vad import load_silero_vad, get_speech_timestamps
+    import torch
+    return get_speech_timestamps(
+        torch.from_numpy(audio), load_silero_vad(), sampling_rate=SAMPLE_RATE,
+        min_silence_duration_ms=300, min_speech_duration_ms=250, speech_pad_ms=100,
+        return_seconds=False)
+
+
+def _asr_chunks(segs, target_s=24.0):
+    """Merge VAD segments into <=target_s chunks (good context for Whisper)."""
+    if not segs:
+        return []
+    tgt = int(target_s * SAMPLE_RATE)
+    chunks, cs, ce = [], segs[0]["start"], segs[0]["end"]
+    for seg in segs[1:]:
+        if seg["end"] - cs <= tgt:
+            ce = seg["end"]
+        else:
+            chunks.append((cs, ce)); cs, ce = seg["start"], seg["end"]
+    chunks.append((cs, ce))
+    return chunks
+
+
+# ── diarization: pyannote 3.1 (preferred) ──────────────────────────────────
+
+def _load_pyannote():
+    """Load pyannote 3.1, applying the torch-2.8 / speechbrain-1.1 compat patches."""
+    global _PYANNOTE, _PYANNOTE_TRIED
+    if _PYANNOTE is not None or _PYANNOTE_TRIED:
+        return _PYANNOTE
+    _PYANNOTE_TRIED = True
+    try:
+        # speechbrain 1.1 lazily imports optional integrations (k2/nlp/numba) that
+        # aren't buildable on macOS; make those failures non-fatal.
+        import speechbrain.utils.importutils as IU
+        _orig = IU.LazyModule.ensure_module
+
+        def _safe(self, stacklevel=1):
+            try:
+                return _orig(self, stacklevel + 1)
+            except Exception:
+                stub = types.ModuleType(getattr(self, "target", "stub"))
+                self.lazy_module = stub
+                return stub
+        IU.LazyModule.ensure_module = _safe
+    except Exception:
+        pass
+    try:
+        import torch
+        _orig_load = torch.load  # pyannote ckpt is trusted; allow full unpickle on torch>=2.6
+        torch.load = lambda *a, **k: _orig_load(*a, **{**k, "weights_only": False})
+        from pyannote.audio import Pipeline
+        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+        if pipe is None:
+            # pyannote.audio returns None (no exception) when the model is
+            # gated and no token/accepted-terms is available -- this is the
+            # single most common reason diarization silently degrades to the
+            # weaker resemblyzer fallback, so make it loud.
+            print(
+                "[diarize] pyannote/speaker-diarization-3.1 returned None -- "
+                "this means either no Hugging Face token is configured, or "
+                "the account behind it hasn't accepted the model's terms. "
+                "Fix: run `huggingface-cli login` with a token from "
+                "https://hf.co/settings/tokens, then accept the terms at "
+                "https://hf.co/pyannote/speaker-diarization-3.1 with that "
+                "SAME account. Falling back to resemblyzer diarization "
+                "(lower speaker-separation quality) for now.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+        if torch.cuda.is_available():
+            gpu_device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            gpu_device = torch.device("mps")
+        else:
+            gpu_device = None
+        if gpu_device is not None:
+            try:
+                pipe.to(gpu_device)
+            except Exception as e:
+                print(f"[diarize] pyannote loaded but failed to move to {gpu_device}: "
+                     f"{type(e).__name__}: {e} -- continuing on CPU", file=sys.stderr, flush=True)
+        print("[diarize] pyannote/speaker-diarization-3.1 loaded successfully "
+             f"(device={gpu_device or 'cpu'})", file=sys.stderr, flush=True)
+        _PYANNOTE = pipe
+    except Exception as e:
+        print(f"[diarize] pyannote failed to load: {type(e).__name__}: {e} -- "
+             "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
+        _PYANNOTE = None
+    return _PYANNOTE
+
+
+# def _diarize_pyannote(audio):
+#     import torch
+#     pipe = _load_pyannote()
+#     if pipe is None:
+#         return None
+#     dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+#     turns = [(seg.start, seg.end, spk) for seg, _, spk in dia.itertracks(yield_label=True)]
+#     turns.sort(key=lambda t: t[0])
+#     return turns
+def _diarize_pyannote(audio):
+    import torch
+    pipe = _load_pyannote()
+    if pipe is None:
+        return None
+    dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+    # pyannote 4.x returns a DiarizeOutput object; the turns live under
+    # .speaker_diarization as (turn, speaker) pairs, rather than the old
+    # Annotation.itertracks(yield_label=True) API used in pyannote 3.x.
+    turns = [(turn.start, turn.end, spk) for turn, spk in dia.speaker_diarization]
+    turns.sort(key=lambda t: t[0])
+    return turns
+
+
+# ── diarization fallback: resemblyzer ──────────────────────────────────────
+
+def _diarize_resemblyzer(audio, segs):
+    global _ENCODER
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    from sklearn.cluster import AgglomerativeClustering
+    if _ENCODER is None:
+        _ENCODER = VoiceEncoder("cpu")
+    embs, min_len = [], int(1.6 * SAMPLE_RATE)
+    for s in segs:
+        a, b = s["start"], s["end"]
+        if b - a < min_len:
+            c = (a + b) // 2
+            a, b = max(0, c - min_len // 2), min(len(audio), c + min_len // 2)
+        embs.append(_ENCODER.embed_utterance(preprocess_wav(audio[a:b], source_sr=SAMPLE_RATE)))
+    if len(embs) <= 1:
+        labels = [0] * len(embs)
+    else:
+        labels = AgglomerativeClustering(n_clusters=None, metric="cosine", linkage="average",
+                                         distance_threshold=0.40).fit_predict(np.vstack(embs))
+    return [(s["start"] / SAMPLE_RATE, s["end"] / SAMPLE_RATE, f"SPK{int(l)}")
+            for s, l in zip(segs, labels)]
+
+
+def _assign_speaker(seg_start, seg_end, turns):
+    """Speaker whose diarization turns overlap this segment the most."""
+    if not turns:
+        return None
+    overlap = defaultdict(float)
+    for ts, te, spk in turns:
+        ov = min(seg_end, te) - max(seg_start, ts)
+        if ov > 0:
+            overlap[spk] += ov
+    if not overlap:
+        # no overlap (short gap) -> nearest turn by midpoint
+        mid = (seg_start + seg_end) / 2
+        return min(turns, key=lambda t: abs((t[0] + t[1]) / 2 - mid))[2]
+    return max(overlap.items(), key=lambda kv: kv[1])[0]
+
+
+# ── text + output helpers ──────────────────────────────────────────────────
+
+def _normalizer():
+    global _NORMALIZER
+    if _NORMALIZER is None:
+        from hazm import Normalizer
+        _NORMALIZER = Normalizer(correct_spacing=True, remove_diacritics=True,
+                                 remove_specials_chars=True, decrease_repeated_chars=True,
+                                 persian_style=True, persian_numbers=False,
+                                 unicodes_replacement=True, seperate_mi=True)
+    return _NORMALIZER
+
+
+def _words_from(text, start, end, speaker):
+    toks = text.split()
+    if not toks:
+        return []
+    step = (end - start) / len(toks)
+    return [{"start": round(start + i * step, 2), "end": round(start + (i + 1) * step, 2),
+             "text": w, "speaker": speaker} for i, w in enumerate(toks)]
+
+
+def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
+               correct_fn=None) -> dict:
+    import asr_engine
+    t0 = time.time()
+    nz = _normalizer()
+
+    _log("Decoding audio…", progress)
+    audio = decode_audio(path)
+    duration = len(audio) / SAMPLE_RATE
+
+    _log("Detecting speech (VAD)…", progress)
+    vad = _vad_segments(audio)
+    if not vad:
+        vad = [{"start": 0, "end": len(audio)}]
+    chunks = _asr_chunks(vad)
+
+    # diarization runs independently of the ASR chunking. `diarizer_used`
+    # tracks what ACTUALLY produced `turns` this run (not inferred from
+    # global state afterwards), so the result's "diarizer" field is accurate
+    # even if pyannote loaded fine earlier but this particular run fell back.
+    turns = None
+    diarizer_used = "none"
+    if diarize and DIARIZER != "off":
+        _log("Identifying speakers…", progress)
+        if DIARIZER == "pyannote":
+            try:
+                turns = _diarize_pyannote(audio)
+                if turns is not None:
+                    diarizer_used = "pyannote"
+            except Exception as e:
+                print(f"[diarize] pyannote diarization run failed: {type(e).__name__}: {e} -- "
+                     "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
+                turns = None
+        if turns is None and DIARIZER in ("pyannote", "resemblyzer"):
+            # either pyannote was never selected, returned nothing (gated/no
+            # token), or raised above -- try the lighter local fallback
+            try:
+                turns = _diarize_resemblyzer(audio, vad)
+                if turns is not None:
+                    diarizer_used = "resemblyzer"
+            except Exception as e:
+                print(f"[diarize] resemblyzer fallback also failed: {type(e).__name__}: {e} -- "
+                     "continuing with no speaker separation", file=sys.stderr, flush=True)
+                turns = None
+        print(f"[diarize] this run used: {diarizer_used}", file=sys.stderr, flush=True)
+
+    # transcribe chunk-by-chunk, assigning the speaker (by overlap) and emitting
+    # each finished segment immediately so the UI can stream the transcript.
+    label_map, segments = {}, []
+    recent_context = []  # last few corrected "Sx: text" lines, for correct_fn context
+    n = len(chunks)
+    for i, (a, b) in enumerate(chunks):
+        _log(f"Transcribing {i+1}/{n}…", progress)
+        if b - a < int(0.1 * SAMPLE_RATE):
+            continue
+        chunk_segments = asr_engine.transcribe_chunk(audio[a:b], SAMPLE_RATE)
+        off = a / SAMPLE_RATE
+        for s in chunk_segments:
+            raw = s["text"].strip()
+            if not raw:
+                continue
+            st, en = round(off + s["start"], 2), round(off + s["end"], 2)
+            spk_raw = _assign_speaker(st, en, turns) if turns else "SPK0"
+            if spk_raw not in label_map:
+                label_map[spk_raw] = f"S{len(label_map)+1}"
+            spk = label_map[spk_raw]
+            text = nz.normalize(raw)
+            if correct_fn:
+                # optional per-segment GPT cleanup, applied before the segment
+                # is ever surfaced (streamed or in the final result). Pass a
+                # short rolling context of prior corrected segments so the
+                # model has enough grounding to resolve ambiguous words
+                # instead of defaulting to "[نامفهوم]" for lack of context.
+                context = "\n".join(recent_context[-4:])
+                text = correct_fn(text, spk, context)
+            seg = {"speaker": spk, "start": st, "end": en,
+                   "text": text, "words": _words_from(text, st, en, spk)}
+            segments.append(seg)
+            if text:
+                recent_context.append(f"{spk}: {text}")
+            if on_segment:
+                on_segment(seg)
+
+    segments.sort(key=lambda s: s["start"])
+    speakers = sorted({s["speaker"] for s in segments}, key=lambda x: int(x[1:]))
+    raw_text = "\n\n".join(f"[{s['speaker']}]: {s['text']}" for s in segments)
+    return {
+        "duration": round(duration, 2),
+        "language": "fa",
+        "segments": segments,
+        "rawText": raw_text,
+        "speakers": speakers,
+        "processingTime": round(time.time() - t0, 1),
+        "diarizer": diarizer_used,
+    }
