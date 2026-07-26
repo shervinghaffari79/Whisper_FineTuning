@@ -10,3 +10,4 @@ __pycache__/
 *.env
 __MACOSX/
 .DS_Store 
+Whisper_Finetuning/finetune_persian/run1/ 
