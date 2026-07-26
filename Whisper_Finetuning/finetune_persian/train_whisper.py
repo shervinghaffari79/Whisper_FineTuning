@@ -30,11 +30,14 @@ import torch
 import transformers
 from datasets import load_from_disk
 from transformers import (
+    EarlyStoppingCallback,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
+
+from fa_text import normalize_for_wer
 
 
 def main():
@@ -73,7 +76,21 @@ def main():
         "update off-TTY, which floods a log; 'never' forces the compact log form",
     )
     parser.add_argument("--max-train-samples", type=int, default=None, help="for smoke-testing")
-    parser.add_argument("--max-eval-samples", type=int, default=None, help="for smoke-testing")
+    parser.add_argument(
+        "--max-eval-samples", type=int, default=None,
+        help="cap the validation set (a randomly drawn but seed-stable subset). Eval "
+        "runs generate() over every clip and easily costs more wall clock than the "
+        "training it is measuring -- 128-256 clips track the full-set WER closely "
+        "enough to pick a checkpoint",
+    )
+    parser.add_argument(
+        "--early-stopping-patience", type=int, default=0,
+        help="stop after N consecutive evals with no WER improvement (0 disables). "
+        "Cheap insurance on a small dataset, where WER typically bottoms out long "
+        "before the epoch budget runs out and the remaining hours only overfit",
+    )
+    parser.add_argument("--seed", type=int, default=42,
+                        help="seeds training and the --max-*-samples subsets")
     parser.add_argument(
         "--clips-dir", default=None,
         help="dir holding the audio clips referenced by the dataset; defaults to a "
@@ -101,10 +118,19 @@ def main():
         raise SystemExit(f"clips dir not found: {clips_dir} (pass --clips-dir)")
 
     ds = load_from_disk(args.dataset)
-    if args.max_train_samples:
-        ds["train"] = ds["train"].select(range(min(args.max_train_samples, len(ds["train"]))))
-    if args.max_eval_samples:
-        ds["validation"] = ds["validation"].select(range(min(args.max_eval_samples, len(ds["validation"]))))
+    # Subsample by SHUFFLING first, with a fixed seed. sm_04 emits clips grouped
+    # by video and ordered by position within it, so a plain .select(range(n))
+    # would hand back the opening n clips of whichever video sorts first -- one
+    # speaker, one topic, one recording condition. Capping eval that way makes
+    # the WER faster and meaningless at the same time. The fixed seed keeps the
+    # subset identical across runs so the numbers stay comparable.
+    if args.max_train_samples and args.max_train_samples < len(ds["train"]):
+        ds["train"] = ds["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+    if args.max_eval_samples and args.max_eval_samples < len(ds["validation"]):
+        ds["validation"] = (ds["validation"].shuffle(seed=args.seed)
+                            .select(range(args.max_eval_samples)))
+    print(f"train={len(ds['train'])} clips, validation={len(ds['validation'])} clips",
+          file=sys.stderr)
 
     processor = WhisperProcessor.from_pretrained(args.base_model, language=args.language, task="transcribe")
 
@@ -139,12 +165,36 @@ def main():
     wer_metric = evaluate.load("wer")
 
     def compute_metrics(pred):
-        pred_ids = pred.predictions
-        label_ids = pred.label_ids
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+        # predict_with_generate can hand back a tuple (sequences, scores, ...)
+        pred_ids = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+        # np.where, not in-place: pred.label_ids is Trainer's own buffer and
+        # mutating it corrupts anything that reads the batch after us
+        label_ids = np.where(pred.label_ids == -100, processor.tokenizer.pad_token_id,
+                             pred.label_ids)
         pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-        return {"wer": 100 * wer_metric.compute(predictions=pred_str, references=label_str)}
+
+        # Score on normalized text, the same normalization eval_baseline.py
+        # applies, so the two WERs are comparable. Unnormalized, every comma
+        # the model places differently is a full word substitution -- sm_04
+        # attaches punctuation to the preceding word -- which buries the
+        # recognition signal this metric is supposed to expose and, because
+        # metric_for_best_model="wer", drags checkpoint selection with it.
+        refs = [normalize_for_wer(s) for s in label_str]
+        hyps = [normalize_for_wer(s) for s in pred_str]
+        keep = [i for i, r in enumerate(refs) if r.strip()]
+        if not keep:
+            return {"wer": 100.0, "wer_raw": 100.0}
+        refs_k = [refs[i] for i in keep]
+        hyps_k = [hyps[i] for i in keep]
+        return {
+            "wer": 100 * wer_metric.compute(predictions=hyps_k, references=refs_k),
+            # kept visible so the gap between the two shows how much of the
+            # error is punctuation/orthography rather than recognition
+            "wer_raw": 100 * wer_metric.compute(
+                predictions=[pred_str[i] for i in keep],
+                references=[label_str[i] for i in keep]),
+        }
 
     # The checkpoint ships bf16 weights and recent transformers preserves the
     # checkpoint dtype on load. Two problems with that here: a T4 (sm_75) has no
@@ -201,10 +251,16 @@ def main():
         metric_for_best_model="wer",
         greater_is_better=False,
         save_total_limit=2,
+        seed=args.seed,
         # a PeftModel's forward signature hides "labels" from Trainer's
         # auto-detection, so name it explicitly or eval loss/WER come out empty
         label_names=["labels"] if args.use_lora else None,
     )
+
+    callbacks = []
+    if args.early_stopping_patience > 0:
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args.early_stopping_patience))
 
     trainer = Seq2SeqTrainer(
         args=training_args,
@@ -214,6 +270,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         processing_class=processor.feature_extractor,
+        callbacks=callbacks,
     )
 
     trainer.train()

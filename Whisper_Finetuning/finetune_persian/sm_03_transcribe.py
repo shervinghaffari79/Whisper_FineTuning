@@ -135,6 +135,13 @@ def main():
         if dest.exists():
             print(f"[{i}/{len(files)}] {path.stem}: already transcribed, skipping", file=sys.stderr)
             continue
+        # a transcript under val/ is a hand-checked label sm_04 holds out; billing
+        # Speechmatics to overwrite it would both cost money and leave the id with
+        # a transcript in two dirs, which sm_04 rejects
+        if (out_dir / "val" / f"{path.stem}.json").exists():
+            print(f"[{i}/{len(files)}] {path.stem}: has a validation transcript, skipping",
+                  file=sys.stderr)
+            continue
         size_mb = path.stat().st_size / 1e6
         print(f"[{i}/{len(files)}] {path.stem}: uploading {size_mb:.1f}MB...", file=sys.stderr)
         t0 = time.time()

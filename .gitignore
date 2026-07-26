@@ -1,6 +1,17 @@
-finetune_persian/sm_data/*
-!finetune_persian/sm_data/links.jsonl
-!finetune_persian/sm_data/urls.txt
-finetune_persian/run1/
-finetune_persian/run_smoke/
 .DS_Store
+
+# Every pattern below is anchored to this file's directory (the repo root), so
+# it must carry the Whisper_Finetuning/ prefix -- the project lives one level
+# down. Without it these patterns match nothing at all, which is what let the
+# audio and run dirs stay un-ignored.
+
+# training outputs: checkpoints, adapters, tensorboard logs, merged CT2 dirs
+Whisper_Finetuning/finetune_persian/run*/
+Whisper_Finetuning/finetune_persian/models/
+
+# bulk data -- downloaded audio, decoded wav16k, cut clips, the built dataset.
+# The manifests and transcripts are the reproducible inputs, so keep those.
+Whisper_Finetuning/finetune_persian/sm_data/*
+!Whisper_Finetuning/finetune_persian/sm_data/links.jsonl
+!Whisper_Finetuning/finetune_persian/sm_data/urls.txt
+!Whisper_Finetuning/finetune_persian/sm_data/transcripts/

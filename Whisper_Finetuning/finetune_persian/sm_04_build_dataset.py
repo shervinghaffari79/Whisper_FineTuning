@@ -15,6 +15,13 @@ boundary (--split-gap) once the segment is at least --min-sec, or until
 --max-sec forces a cut. Whisper's receptive field is 30s, so --max-sec stays
 safely under it.
 
+Train/validation split: the two never share audio from the same recording.
+A transcript placed in <transcripts>/val holds its whole video out, so the
+split is reproducible across rebuilds and visible in the file layout. With no
+val/ dir and no --val-videos it falls back to --val-fraction, which slices the
+alphabetically first ids -- fine for a smoke test, but it reassigns videos
+whenever a new id sorts early, which makes WER incomparable between runs.
+
 Usage:
     python sm_04_build_dataset.py --audio ./sm_data/audio \
         --transcripts ./sm_data/transcripts --out ./sm_data/dataset
@@ -110,6 +117,19 @@ def main():
                         help="drop segments whose mean word confidence is below this")
     parser.add_argument("--min-words", type=int, default=3)
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--val-dir", default=None,
+        help="dir of transcripts whose videos are held out for validation; defaults to "
+        "a 'val' subfolder of --transcripts. Drop a transcript in there and its video "
+        "becomes validation -- no flags to remember on rebuild.",
+    )
+    parser.add_argument(
+        "--val-videos", default=None,
+        help="comma-separated video ids to use as validation, overriding --val-fraction. "
+        "Without this the split takes the alphabetically FIRST ids, so adding a video "
+        "whose id sorts early silently changes the validation set and makes WER "
+        "incomparable across runs. Name them explicitly once you care about the number.",
+    )
     parser.add_argument("--only", default=None, help="build from just this video id (stress test)")
     args = parser.parse_args()
 
@@ -119,11 +139,25 @@ def main():
     clips_dir.mkdir(parents=True, exist_ok=True)
     wav_dir.mkdir(parents=True, exist_ok=True)
 
-    transcripts = sorted(tr_dir.glob("*.json"))
+    # A transcript's LOCATION picks its split: anything under <transcripts>/val
+    # is held out, everything else trains. That keeps the split reproducible
+    # across rebuilds -- unlike --val-fraction, which slices the alphabetically
+    # first ids and so silently reassigns videos whenever a new id sorts early.
+    val_dir = Path(args.val_dir) if args.val_dir else tr_dir / "val"
+    train_transcripts = sorted(tr_dir.glob("*.json"))
+    val_transcripts = sorted(val_dir.glob("*.json")) if val_dir.is_dir() else []
+
+    both = sorted({t.stem for t in train_transcripts} & {t.stem for t in val_transcripts})
+    if both:
+        sys.exit(f"these ids have a transcript in BOTH {tr_dir} and {val_dir}: {both}\n"
+                 f"delete one copy -- otherwise the same audio lands in train and val")
+
+    dir_val_ids = {t.stem for t in val_transcripts}
+    transcripts = train_transcripts + val_transcripts
     if args.only:
         transcripts = [t for t in transcripts if t.stem == args.only]
         if not transcripts:
-            sys.exit(f"no transcript for {args.only} in {tr_dir}")
+            sys.exit(f"no transcript for {args.only} in {tr_dir} or {val_dir}")
 
     rows, stats = [], []
     for tr_path in transcripts:
@@ -138,7 +172,9 @@ def main():
         if sr != SAMPLE_RATE:
             sys.exit(f"{wav_path}: expected {SAMPLE_RATE}Hz, got {sr}")
 
-        sm_json = json.loads(tr_path.read_text(encoding="utf-8"))
+        # utf-8-sig, not utf-8: transcripts round-tripped through a Windows
+        # editor carry a BOM, and json.loads rejects it outright
+        sm_json = json.loads(tr_path.read_text(encoding="utf-8-sig"))
         words = list(iter_words(sm_json))
         segs = segment(words, args.min_sec, args.max_sec, args.split_gap)
 
@@ -177,8 +213,24 @@ def main():
 
     # split by video so train/val never share audio from the same recording
     videos = sorted({r["video_id"] for r in rows})
-    n_val = max(1, round(len(videos) * args.val_fraction)) if len(videos) > 1 else 0
-    val_videos = set(videos[:n_val])
+    named = {v.strip() for v in args.val_videos.split(",") if v.strip()} if args.val_videos else set()
+    if named or dir_val_ids:
+        # the val/ dir and --val-videos are additive, so you can hold out an
+        # extra id for one build without moving files around
+        val_videos = named | dir_val_ids
+        missing = sorted(named - set(videos))
+        if missing:
+            sys.exit(f"--val-videos names ids with no clips: {missing}\n"
+                     f"available: {videos}")
+        val_videos &= set(videos)  # a val transcript whose audio never downloaded
+        if not val_videos:
+            sys.exit("no validation clips were produced -- check that the audio for the "
+                     f"transcripts in {val_dir} downloaded and decoded")
+        if val_videos == set(videos):
+            sys.exit("every video is in validation; nothing left to train on")
+    else:
+        n_val = max(1, round(len(videos) * args.val_fraction)) if len(videos) > 1 else 0
+        val_videos = set(videos[:n_val])
     train_rows = [r for r in rows if r["video_id"] not in val_videos]
     val_rows = [r for r in rows if r["video_id"] in val_videos]
     if not val_rows:  # single-video (stress test): carve a tail slice
@@ -192,9 +244,10 @@ def main():
 
     total_h = sum(r["duration"] for r in rows) / 3600
     print()
-    print(f"{'video':16s} {'words':>7s} {'segs':>6s} {'clips':>6s} {'hours':>7s}")
+    print(f"{'video':16s} {'words':>7s} {'segs':>6s} {'clips':>6s} {'hours':>7s}  split")
     for vid, nw, ns, nk, h in stats:
-        print(f"{vid:16s} {nw:7d} {ns:6d} {nk:6d} {h:7.2f}")
+        split = "val" if vid in val_videos else "train"
+        print(f"{vid:16s} {nw:7d} {ns:6d} {nk:6d} {h:7.2f}  {split}")
     print(f"\ntotal: {len(rows)} clips, {total_h:.2f} hours "
           f"(train={len(train_rows)}, val={len(val_rows)})")
     print(f"dataset  -> {out_dir / 'hf_dataset'}")

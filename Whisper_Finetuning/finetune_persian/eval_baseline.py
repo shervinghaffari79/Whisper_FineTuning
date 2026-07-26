@@ -16,10 +16,8 @@ Requires: faster-whisper, jiwer, datasets, soundfile.
 """
 import argparse
 import json
-import re
 import sys
 import time
-import unicodedata
 from pathlib import Path
 
 import jiwer
@@ -27,22 +25,10 @@ import soundfile as sf
 from datasets import load_from_disk
 
 # Persian orthography varies across sources; without normalizing both sides,
-# WER measures typography rather than recognition quality.
-_ARABIC_TO_PERSIAN = str.maketrans({"ي": "ی", "ك": "ک", "ۀ": "ه", "ة": "ه", "أ": "ا", "إ": "ا", "آ": "ا"})
-_DIACRITICS = re.compile(r"[ً-ْـ]")          # harakat + tatweel
-_ZWNJ = re.compile(r"[‌‎‏]")  # ZWNJ and bidi marks
-_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
-
-
-def normalize_fa(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.translate(_ARABIC_TO_PERSIAN)
-    text = _DIACRITICS.sub("", text)
-    text = _ZWNJ.sub(" ", text)
-    text = _PUNCT.sub(" ", text)
-    for i, (fa, ar) in enumerate(zip("۰۱۲۳۴۵۶۷۸۹", "٠١٢٣٤٥٦٧٨٩")):
-        text = text.replace(fa, str(i)).replace(ar, str(i))
-    return re.sub(r"\s+", " ", text).strip()
+# WER measures typography rather than recognition quality. Shared with
+# train_whisper.compute_metrics so the in-training number and this one are
+# measuring the same thing -- see fa_text.py.
+from fa_text import normalize_for_wer as normalize_fa
 
 
 def main():
@@ -51,7 +37,10 @@ def main():
     parser.add_argument("--dataset", default="./sm_data/dataset/hf_dataset")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--clips-dir", default=None)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="score only N clips, drawn at random but stable for a given "
+                        "--seed so baseline and fine-tuned runs see the same subset")
+    parser.add_argument("--seed", type=int, default=42, help="selects which clips --limit draws")
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda")
     parser.add_argument("--compute-type", default=None)
     parser.add_argument("--save-predictions", default=None, help="write per-clip results to JSONL")
@@ -70,11 +59,19 @@ def main():
 
     clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
     ds = load_from_disk(args.dataset)[args.split]
-    if args.limit:
-        ds = ds.select(range(min(args.limit, len(ds))))
+    # Shuffle before capping. sm_04 emits clips grouped by video and ordered by
+    # position within it, so a plain select(range(n)) scores the opening n clips
+    # of a single recording -- one speaker, one acoustic condition. The fixed
+    # seed keeps the subset identical between the baseline run and the
+    # fine-tuned run, which is the only thing that makes the two comparable.
+    n_total = len(ds)
+    if args.limit and args.limit < n_total:
+        ds = ds.shuffle(seed=args.seed).select(range(args.limit))
 
     print(f"model: {args.model}  ({device}/{compute_type})", file=sys.stderr)
-    print(f"split: {args.split}  n={len(ds)}", file=sys.stderr)
+    print(f"split: {args.split}  n={len(ds)} of {n_total}"
+          + (f"  (random subset, seed={args.seed})" if len(ds) < n_total else ""),
+          file=sys.stderr)
     model = WhisperModel(args.model, device=device, compute_type=compute_type)
 
     refs, hyps, rows = [], [], []
