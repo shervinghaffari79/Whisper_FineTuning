@@ -1,3 +1,6 @@
-sm_data/*
-!sm_data/transcripts/
-!sm_data/transcripts/**
+finetune_persian/sm_data/*
+!finetune_persian/sm_data/links.jsonl
+!finetune_persian/sm_data/urls.txt
+finetune_persian/run1/
+finetune_persian/run_smoke/
+.DS_Store
