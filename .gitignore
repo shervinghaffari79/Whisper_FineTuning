@@ -1,13 +1,3 @@
-.venv-finetune/
-runs/
-run_smoke/
-sm_data/
-data/
-__pycache__/
-*.pyc
-*.wav
-*.m4a
-*.env
-__MACOSX/
-.DS_Store 
-Whisper_Finetuning/finetune_persian/run1/ 
+sm_data/*
+!sm_data/transcripts/
+!sm_data/transcripts/**
