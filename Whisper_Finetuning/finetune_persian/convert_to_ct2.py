@@ -71,25 +71,30 @@ def main():
                         "LoRA adapter (default: <out_dir>_merged)")
     args = parser.parse_args()
 
-    src = Path(args.hf_model_dir)
+    # Keep the ORIGINAL string for the hub path: a repo id is "owner/name" with
+    # a forward slash, and Path() rewrites that to a backslash on Windows, which
+    # huggingface_hub then rejects as an invalid repo id.
+    model_ref = args.hf_model_dir
+    src = Path(model_ref)
     if (src / "adapter_config.json").exists():
         merged = Path(args.merged_dir) if args.merged_dir else Path(str(args.out_dir) + "_merged")
         src = merge_lora(src, merged)
 
-    # A bare Hugging Face repo id ("owner/name") is a valid --model for the
-    # converter, but there is nothing on disk to scan for assets, so ASSET_FILES
-    # all miss and the output lands without tokenizer.json -- which faster-whisper
-    # needs. Materialize the processor next to the weights first and convert from
-    # there, so the local-directory path below stays the only code path.
+    # A bare Hugging Face repo id is a valid --model for the converter, but there
+    # is nothing on disk to scan for assets, so ASSET_FILES all miss and the
+    # output lands without tokenizer.json -- which faster-whisper needs, and
+    # whose absence shows up as a mistranscription rather than an error.
+    # Materialize weights and processor locally first, so the local-directory
+    # path below stays the only code path.
     if not src.is_dir():
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
         staged = Path(args.merged_dir) if args.merged_dir else Path(str(args.out_dir) + "_hf")
-        print(f"{src} is not a local directory -- treating it as a Hugging Face repo id "
-              f"and downloading it to {staged}", file=sys.stderr)
+        print(f"{model_ref} is not a local directory -- treating it as a Hugging Face "
+              f"repo id and downloading it to {staged}", file=sys.stderr)
         staged.mkdir(parents=True, exist_ok=True)
-        WhisperForConditionalGeneration.from_pretrained(str(src)).save_pretrained(str(staged))
-        WhisperProcessor.from_pretrained(str(src)).save_pretrained(str(staged))
+        WhisperForConditionalGeneration.from_pretrained(model_ref).save_pretrained(str(staged))
+        WhisperProcessor.from_pretrained(model_ref).save_pretrained(str(staged))
         src = staged
 
     copy_files = [name for name in ASSET_FILES if (src / name).exists()]
