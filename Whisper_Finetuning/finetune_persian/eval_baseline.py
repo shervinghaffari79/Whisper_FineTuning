@@ -16,6 +16,7 @@ Requires: faster-whisper, jiwer, datasets, soundfile.
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -57,7 +58,22 @@ def main():
             device = "cpu"
     compute_type = args.compute_type or ("int8_float16" if device == "cuda" else "int8")
 
+    # faster-whisper falls back to treating --model as a Hugging Face repo id
+    # whenever the local directory is absent, so a typo'd or wrong path fails
+    # with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'"
+    # -- an error that says nothing about the actual problem. Catch it here
+    # while we can still name the path we looked for.
+    looks_local = (os.sep in args.model or "/" in args.model
+                   or args.model.startswith(".") or Path(args.model).is_absolute())
+    if looks_local and not Path(args.model).is_dir():
+        sys.exit(f"model directory not found: {Path(args.model).resolve()}\n"
+                 f"CT2 models live next to asr_engine.py, not next to this script -- "
+                 f"from finetune_persian/ that is ../whiper/Whisper/models/<name>.\n"
+                 f"Pass a bare name like 'small' to pull from Hugging Face instead.")
+
     clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
+    if not clips_dir.is_dir():
+        sys.exit(f"clips dir not found: {clips_dir.resolve()} (pass --clips-dir)")
     ds = load_from_disk(args.dataset)[args.split]
     # Shuffle before capping. sm_04 emits clips grouped by video and ordered by
     # position within it, so a plain select(range(n)) scores the opening n clips
