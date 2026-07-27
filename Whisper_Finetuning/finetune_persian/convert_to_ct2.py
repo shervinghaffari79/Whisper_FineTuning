@@ -66,6 +66,10 @@ def main():
     parser.add_argument("out_dir")
     parser.add_argument("--quantization", default="int8_float16",
                         help="int8_float16 for CUDA (T4), int8 for CPU")
+    parser.add_argument("--feature-extractor", default="openai/whisper-large-v3",
+                        help="repo to source preprocessor_config.json from when the "
+                        "checkpoint lacks one (must match the base architecture's mel "
+                        "count -- large-v3 is 128, v1/v2 are 80)")
     parser.add_argument("--merged-dir", default=None,
                         help="where to write the merged checkpoint when converting a "
                         "LoRA adapter (default: <out_dir>_merged)")
@@ -96,6 +100,22 @@ def main():
         WhisperForConditionalGeneration.from_pretrained(model_ref).save_pretrained(str(staged))
         WhisperProcessor.from_pretrained(model_ref).save_pretrained(str(staged))
         src = staged
+
+    # faster-whisper reads the mel-bin count from preprocessor_config.json and
+    # from nothing else, silently defaulting to 80 when the file is absent.
+    # large-v3 uses 128, so a model converted without it loads cleanly and then
+    # dies on the first encode with "expected (1, 128, 3000), got (1, 80, 3000)".
+    # transformers>=5 stopped emitting this file from Processor.save_pretrained
+    # (it writes processor_config.json instead), so write it explicitly. The
+    # feature extractor config is architecture-level -- identical across every
+    # large-v3 fine-tune -- so falling back to the stock repo is safe when the
+    # source is a LoRA adapter dir that never carried one.
+    if not (src / "preprocessor_config.json").exists():
+        from transformers import WhisperFeatureExtractor
+
+        fe_ref = model_ref if not Path(model_ref).is_dir() else args.feature_extractor
+        print(f"preprocessor_config.json missing -- regenerating from {fe_ref}", file=sys.stderr)
+        WhisperFeatureExtractor.from_pretrained(fe_ref).save_pretrained(str(src))
 
     copy_files = [name for name in ASSET_FILES if (src / name).exists()]
     cmd = [
