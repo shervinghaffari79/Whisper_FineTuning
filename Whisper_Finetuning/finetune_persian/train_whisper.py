@@ -206,6 +206,14 @@ def main():
     model.generation_config.language = args.language
     model.generation_config.task = "transcribe"
     model.generation_config.forced_decoder_ids = None
+    # eval's predict_with_generate uses plain greedy decoding (no beam search,
+    # no repetition guard) -- on a checkpoint that's still early in training,
+    # that degenerates into looping the same token for dozens of steps on a
+    # subset of clips. Those clips alone can drag eval_wer over 100% even when
+    # the rest of the set is decoding fine, which is noise metric_for_best_model
+    # and early stopping both read directly. Blocking repeated 3-grams costs
+    # nothing on well-formed output and forecloses the loop.
+    model.generation_config.no_repeat_ngram_size = 3
     model.config.use_cache = False  # required with gradient checkpointing
 
     if args.use_lora:
