@@ -76,14 +76,36 @@ def main():
         merged = Path(args.merged_dir) if args.merged_dir else Path(str(args.out_dir) + "_merged")
         src = merge_lora(src, merged)
 
+    # A bare Hugging Face repo id ("owner/name") is a valid --model for the
+    # converter, but there is nothing on disk to scan for assets, so ASSET_FILES
+    # all miss and the output lands without tokenizer.json -- which faster-whisper
+    # needs. Materialize the processor next to the weights first and convert from
+    # there, so the local-directory path below stays the only code path.
+    if not src.is_dir():
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        staged = Path(args.merged_dir) if args.merged_dir else Path(str(args.out_dir) + "_hf")
+        print(f"{src} is not a local directory -- treating it as a Hugging Face repo id "
+              f"and downloading it to {staged}", file=sys.stderr)
+        staged.mkdir(parents=True, exist_ok=True)
+        WhisperForConditionalGeneration.from_pretrained(str(src)).save_pretrained(str(staged))
+        WhisperProcessor.from_pretrained(str(src)).save_pretrained(str(staged))
+        src = staged
+
     copy_files = [name for name in ASSET_FILES if (src / name).exists()]
     cmd = [
         "ct2-transformers-converter",
         "--model", str(src),
         "--output_dir", args.out_dir,
         "--quantization", args.quantization,
-        "--copy_files", *copy_files,
     ]
+    # --copy_files is nargs="+" on the converter side, so passing the flag with
+    # no values is an argparse error rather than a no-op
+    if copy_files:
+        cmd += ["--copy_files", *copy_files]
+    else:
+        print("WARNING: no processor assets found in the source dir; the converted "
+              "model may not load in faster-whisper", file=sys.stderr)
     print("running:", " ".join(cmd), file=sys.stderr)
     subprocess.run(cmd, check=True)
     print(f"converted -> {args.out_dir}")
