@@ -160,20 +160,26 @@ def main():
         has_named_val = split in ("validation", "val", "test")
         id_col = None if args.id_column == "none" else args.id_column
         rows, total_sec = [], 0.0
+        n_scanned = n_empty = n_dur = 0
+        hit_budget = False
         for i, row in enumerate(ds):
             if args.max_seconds_per_repo and total_sec >= args.max_seconds_per_repo:
+                hit_budget = True
                 break
             if id_col == "auto":  # probe the first row we actually see
                 id_col = next((c for c in ("video_id", "episode_id", "id") if c in row), None)
                 print(f"[{tag}] recording id column: {id_col or 'none -- will tail-slice'}",
                       file=sys.stderr)
+            n_scanned += 1
             text = normalize_fa(row.get(text_col) or "")
             if not text:
+                n_empty += 1
                 continue
             audio, sr = decode_row_audio(row["audio"])
             audio = resample_if_needed(audio, sr)
             dur = len(audio) / SAMPLE_RATE
             if dur < args.min_sec or dur > args.max_sec:
+                n_dur += 1
                 continue
             name = f"{tag}_{i:06d}.wav"
             sf.write(clips_dir / name, audio, SAMPLE_RATE)
@@ -191,6 +197,19 @@ def main():
             mode = "train, tail-sliced for val"
         print(f"[{tag}] done: {len(rows)} clips, {total_sec / 3600:.2f}h ({mode})",
               file=sys.stderr)
+        # Say WHY the loop ended and what it discarded. Without this a build that
+        # stopped at its budget after 4% of the repo is indistinguishable from one
+        # that read the whole thing and threw most of it away -- the two call for
+        # opposite responses (raise the budget vs loosen the filters).
+        print(f"[{tag}] scanned {n_scanned} rows -> kept {len(rows)}"
+              f" (dropped {n_empty} empty-text, {n_dur} outside "
+              f"{args.min_sec}-{args.max_sec}s)", file=sys.stderr)
+        if hit_budget:
+            print(f"[{tag}] STOPPED at the --max-seconds-per-repo budget "
+                  f"({args.max_seconds_per_repo:.0f}s) -- the repo has more available; "
+                  f"raise it to pull more", file=sys.stderr)
+        else:
+            print(f"[{tag}] reached the end of the split", file=sys.stderr)
 
         if has_named_val:
             val_rows.extend(rows)

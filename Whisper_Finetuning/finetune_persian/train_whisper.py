@@ -117,6 +117,22 @@ def main():
         "--eval-clips-dir", default=None,
         help="clips dir for --eval-dataset; defaults to a 'clips' folder next to it",
     )
+    parser.add_argument(
+        "--features", choices=["auto", "lazy", "precompute"], default="auto",
+        help="how log-mel features are produced. precompute caches every clip's features "
+        "to disk up front (fast per step, but a large-v3 feature is 1.46 MiB, so 100k "
+        "clips is ~146 GiB of cache). lazy computes them per batch and caches nothing -- "
+        "measured overhead is ~0.03s/clip against a ~16s training step. auto picks lazy "
+        "above --lazy-threshold clips.",
+    )
+    parser.add_argument("--lazy-threshold", type=int, default=20000,
+                        help="clip count above which --features auto chooses lazy")
+    parser.add_argument(
+        "--dataloader-workers", type=int, default=0,
+        help="parallel feature extraction for --features lazy. 0 keeps it in the training "
+        "process (safe everywhere); 2-4 helps if extraction ever becomes the bottleneck, "
+        "but worker spawn is slow on Windows",
+    )
     args = parser.parse_args()
 
     if args.init_adapter and not args.use_lora:
@@ -187,16 +203,47 @@ def main():
             return batch
         return prepare
 
-    # mapped per-split rather than over the whole DatasetDict at once: train and
-    # validation can now come from different clip directories (--eval-dataset),
-    # and hf_build_dataset.py's manifest columns (audio/text/source/duration)
-    # differ from sm_04's (audio/text/video_id/start/duration/confidence) -- a
-    # single remove_columns list across both splits breaks the moment they diverge
-    ds["train"] = ds["train"].map(make_prepare(clips_dir), remove_columns=ds["train"].column_names,
-                                   num_proc=1, desc="extracting log-mel features (train)")
-    ds["validation"] = ds["validation"].map(make_prepare(eval_clips_dir),
-                                             remove_columns=ds["validation"].column_names,
-                                             num_proc=1, desc="extracting log-mel features (validation)")
+    def make_batch_prepare(audio_dir):
+        """Batched form of the same work, for set_transform (which hands the
+        transform a dict of column -> list and expects the same shape back)."""
+        def transform(batch):
+            feats, labels = [], []
+            for name, text in zip(batch["audio"], batch["text"]):
+                audio, sr = sf.read(audio_dir / name, dtype="float32")
+                feats.append(processor.feature_extractor(
+                    audio, sampling_rate=sr).input_features[0])
+                labels.append(processor.tokenizer(text).input_ids)
+            return {"input_features": feats, "labels": labels}
+        return transform
+
+    n_clips = len(ds["train"]) + len(ds["validation"])
+    lazy = args.features == "lazy" or (args.features == "auto" and n_clips > args.lazy_threshold)
+    if lazy:
+        # A large-v3 log-mel is 128x3000 float32 = 1.46 MiB. Precomputing them for
+        # a full-corpus run means hundreds of GiB of Arrow cache written before the
+        # first step -- 278k clips is ~397 GiB. set_transform computes each batch on
+        # demand and caches nothing; at ~0.03s/clip against a ~16s step that is
+        # noise. Trainer must not strip the audio/text columns the transform reads,
+        # hence remove_unused_columns=False below.
+        print(f"features: lazy (on-the-fly, no cache) for {n_clips} clips", file=sys.stderr)
+        ds["train"].set_transform(make_batch_prepare(clips_dir))
+        ds["validation"].set_transform(make_batch_prepare(eval_clips_dir))
+    else:
+        # mapped per-split rather than over the whole DatasetDict at once: train and
+        # validation can now come from different clip directories (--eval-dataset),
+        # and hf_build_dataset.py's manifest columns (audio/text/source/duration)
+        # differ from sm_04's (audio/text/video_id/start/duration/confidence) -- a
+        # single remove_columns list across both splits breaks the moment they diverge
+        est = n_clips * 128 * 3000 * 4 / 1024 ** 3
+        print(f"features: precomputed to cache for {n_clips} clips (~{est:.0f} GiB)",
+              file=sys.stderr)
+        ds["train"] = ds["train"].map(make_prepare(clips_dir),
+                                      remove_columns=ds["train"].column_names,
+                                      num_proc=1, desc="extracting log-mel features (train)")
+        ds["validation"] = ds["validation"].map(make_prepare(eval_clips_dir),
+                                                remove_columns=ds["validation"].column_names,
+                                                num_proc=1,
+                                                desc="extracting log-mel features (validation)")
 
     class DataCollatorSpeechSeq2SeqWithPadding:
         def __call__(self, features):
@@ -315,6 +362,11 @@ def main():
         greater_is_better=False,
         save_total_limit=2,
         seed=args.seed,
+        dataloader_num_workers=args.dataloader_workers,
+        # with lazy features the transform reads the audio/text columns at batch
+        # time; Trainer's default column pruning would strip them as "unused"
+        # (they are not model inputs) and the transform would raise KeyError
+        remove_unused_columns=not lazy,
         # a PeftModel's forward signature hides "labels" from Trainer's
         # auto-detection, so name it explicitly or eval loss/WER come out empty
         label_names=["labels"] if args.use_lora else None,
