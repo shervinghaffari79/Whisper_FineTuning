@@ -106,7 +106,8 @@ def main():
             continue
         refs.append(ref_n)
         hyps.append(hyp_n)
-        rows.append({"audio": ex["audio"], "ref": ex["text"], "hyp": hyp})
+        rows.append({"audio": ex["audio"], "ref": ex["text"], "hyp": hyp,
+                     "source": ex.get("source")})
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(ds)}  ({(time.time() - t0) / (i + 1):.2f}s/clip)", file=sys.stderr)
 
@@ -118,6 +119,22 @@ def main():
     print(f"WER          : {100 * jiwer.wer(refs, hyps):.2f}%")
     print(f"CER          : {100 * jiwer.cer(refs, hyps):.2f}%")
     print(f"wall time    : {time.time() - t0:.1f}s")
+
+    # A blended validation set (blend_datasets.py) mixes populations, and the
+    # aggregate over a set that grew is NOT comparable to a number measured
+    # before the growth -- adding easier or harder voices moves it on its own.
+    # The per-source rows are what stay comparable run to run, so print them
+    # whenever the dataset carries a source column.
+    sources = sorted({r["source"] for r in rows if r.get("source")})
+    if len(sources) > 1:
+        print("\n--- by source ---")
+        print(f"{'source':24s} {'clips':>6s} {'WER':>8s} {'CER':>8s}")
+        for src in sources:
+            idx = [i for i, r in enumerate(rows) if r.get("source") == src]
+            s_refs = [refs[i] for i in idx]
+            s_hyps = [hyps[i] for i in idx]
+            print(f"{src:24s} {len(idx):6d} {100 * jiwer.wer(s_refs, s_hyps):7.2f}% "
+                  f"{100 * jiwer.cer(s_refs, s_hyps):7.2f}%")
     print("\n--- sample predictions ---")
     for row in rows[:5]:
         print(f"  ref: {row['ref']}")
