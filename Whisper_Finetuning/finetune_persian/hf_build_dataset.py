@@ -49,6 +49,8 @@ from sm_04_build_dataset import normalize_fa
 SAMPLE_RATE = 16000
 
 
+import os
+
 def decode_row_audio(raw: dict):
     """raw is {"bytes": ..., "path": ...} from an Audio(decode=False) column --
     decode=False so this never touches the Audio feature's torchcodec-backed
@@ -59,16 +61,21 @@ def decode_row_audio(raw: dict):
         audio, sr = sf.read(io.BytesIO(raw["bytes"]), dtype="float32")
     except Exception:
         suffix = Path(raw.get("path") or "clip.audio").suffix or ".audio"
-        with tempfile.NamedTemporaryFile(suffix=suffix) as src, \
-             tempfile.NamedTemporaryFile(suffix=".wav") as dst:
-            src.write(raw["bytes"])
-            src.flush()
+        src_fd, src_path = tempfile.mkstemp(suffix=suffix)
+        dst_fd, dst_path = tempfile.mkstemp(suffix=".wav")
+        try:
+            with open(src_fd, "wb") as f:
+                f.write(raw["bytes"])
+            os.close(dst_fd)
             subprocess.run(
-                ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src.name,
-                 "-ar", str(SAMPLE_RATE), "-ac", "1", dst.name],
+                ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src_path,
+                 "-ar", str(SAMPLE_RATE), "-ac", "1", dst_path],
                 check=True,
             )
-            audio, sr = sf.read(dst.name, dtype="float32")
+            audio, sr = sf.read(dst_path, dtype="float32")
+        finally:
+            os.unlink(src_path)
+            os.unlink(dst_path)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     return audio, sr
@@ -77,15 +84,21 @@ def decode_row_audio(raw: dict):
 def resample_if_needed(audio, sr):
     if sr == SAMPLE_RATE:
         return audio
-    with tempfile.NamedTemporaryFile(suffix=".wav") as src, \
-         tempfile.NamedTemporaryFile(suffix=".wav") as dst:
-        sf.write(src.name, audio, sr)
+    src_fd, src_path = tempfile.mkstemp(suffix=".wav")
+    dst_fd, dst_path = tempfile.mkstemp(suffix=".wav")
+    try:
+        os.close(src_fd)
+        os.close(dst_fd)
+        sf.write(src_path, audio, sr)
         subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src.name,
-             "-ar", str(SAMPLE_RATE), "-ac", "1", dst.name],
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src_path,
+             "-ar", str(SAMPLE_RATE), "-ac", "1", dst_path],
             check=True,
         )
-        audio, _ = sf.read(dst.name, dtype="float32")
+        audio, _ = sf.read(dst_path, dtype="float32")
+    finally:
+        os.unlink(src_path)
+        os.unlink(dst_path)
     return audio
 
 
@@ -167,11 +180,11 @@ def main():
             val_rows.extend(rows[-cut:] if cut else [])
             train_rows.extend(rows[:-cut] if cut else rows)
 
-    if not train_rows:
-        sys.exit("no training clips produced")
+    if not train_rows and not val_rows:
+        sys.exit("no clips produced at all")
     if not val_rows:
         sys.exit("no validation clips produced -- pass a repo with a val/test split "
-                 "or raise --val-fraction")
+                "or raise --val-fraction")
 
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for r in train_rows + val_rows:
