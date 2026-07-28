@@ -70,6 +70,14 @@ def main():
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument(
+        "--init-adapter", default=None,
+        help="warm-start from an existing LoRA adapter (e.g. run1/final) instead of a "
+        "fresh random one -- for continuing training on new data without discarding "
+        "what a prior run learned. Weights only: optimizer/scheduler state is NOT "
+        "restored, so this seeds a new training run rather than resuming the old one. "
+        "Requires --use-lora.",
+    )
+    parser.add_argument(
         "--progress", choices=["auto", "always", "never"], default="auto",
         help="auto (default) shows a live progress bar on a terminal and falls back to "
         "periodic step logs when output is piped to a file -- tqdm writes one line per "
@@ -96,10 +104,33 @@ def main():
         help="dir holding the audio clips referenced by the dataset; defaults to a "
         "'clips' folder next to --dataset (where sm_04 puts them)",
     )
+    parser.add_argument(
+        "--eval-dataset", default=None,
+        help="use this dataset's 'validation' split for eval instead of --dataset's own. "
+        "For training on a broad corpus (e.g. hf_build_dataset.py output) while still "
+        "tracking WER on your real target-domain validation set -- otherwise the metric "
+        "driving checkpoint selection and early stopping stops reflecting what you "
+        "actually care about, and you can't tell a broad-domain gain from a target-"
+        "domain regression.",
+    )
+    parser.add_argument(
+        "--eval-clips-dir", default=None,
+        help="clips dir for --eval-dataset; defaults to a 'clips' folder next to it",
+    )
     args = parser.parse_args()
 
+    if args.init_adapter and not args.use_lora:
+        raise SystemExit("--init-adapter requires --use-lora")
+
     if args.lr is None:
-        args.lr = 1e-3 if args.use_lora else 1e-5
+        if args.init_adapter:
+            # an adapter that already converged needs a gentler nudge than one
+            # starting from a random init -- 1e-3 (the from-scratch default) risks
+            # kicking it out of its current optimum before the new data's steps
+            # are enough to bring it back down
+            args.lr = 2e-4
+        else:
+            args.lr = 1e-3 if args.use_lora else 1e-5
 
     # Progress reporting: tqdm redraws in place on a terminal, but emits a NEW
     # LINE per update when stdout is a pipe/log file -- which floods the output
@@ -118,6 +149,14 @@ def main():
         raise SystemExit(f"clips dir not found: {clips_dir} (pass --clips-dir)")
 
     ds = load_from_disk(args.dataset)
+    eval_clips_dir = clips_dir
+    if args.eval_dataset:
+        eval_clips_dir = (Path(args.eval_clips_dir) if args.eval_clips_dir
+                          else Path(args.eval_dataset).parent / "clips")
+        if not eval_clips_dir.exists():
+            raise SystemExit(f"eval clips dir not found: {eval_clips_dir} (pass --eval-clips-dir)")
+        ds["validation"] = load_from_disk(args.eval_dataset)["validation"]
+
     # Subsample by SHUFFLING first, with a fixed seed. sm_04 emits clips grouped
     # by video and ordered by position within it, so a plain .select(range(n))
     # would hand back the opening n clips of whichever video sorts first -- one
@@ -129,24 +168,35 @@ def main():
     if args.max_eval_samples and args.max_eval_samples < len(ds["validation"]):
         ds["validation"] = (ds["validation"].shuffle(seed=args.seed)
                             .select(range(args.max_eval_samples)))
-    print(f"train={len(ds['train'])} clips, validation={len(ds['validation'])} clips",
+    print(f"train={len(ds['train'])} clips, validation={len(ds['validation'])} clips"
+          + (f"  (eval from {args.eval_dataset})" if args.eval_dataset else ""),
           file=sys.stderr)
 
     processor = WhisperProcessor.from_pretrained(args.base_model, language=args.language, task="transcribe")
 
-    def prepare(batch):
-        # read the clip with soundfile rather than datasets' Audio feature:
-        # the Audio feature now requires torchcodec, whose bundled FFmpeg libs
-        # don't link on every platform, and we already know these are 16kHz mono
-        audio, sr = sf.read(clips_dir / batch["audio"], dtype="float32")
-        batch["input_features"] = processor.feature_extractor(
-            audio, sampling_rate=sr
-        ).input_features[0]
-        batch["labels"] = processor.tokenizer(batch["text"]).input_ids
-        return batch
+    def make_prepare(audio_dir):
+        def prepare(batch):
+            # read the clip with soundfile rather than datasets' Audio feature:
+            # the Audio feature now requires torchcodec, whose bundled FFmpeg libs
+            # don't link on every platform, and we already know these are 16kHz mono
+            audio, sr = sf.read(audio_dir / batch["audio"], dtype="float32")
+            batch["input_features"] = processor.feature_extractor(
+                audio, sampling_rate=sr
+            ).input_features[0]
+            batch["labels"] = processor.tokenizer(batch["text"]).input_ids
+            return batch
+        return prepare
 
-    ds = ds.map(prepare, remove_columns=ds["train"].column_names, num_proc=1,
-                desc="extracting log-mel features")
+    # mapped per-split rather than over the whole DatasetDict at once: train and
+    # validation can now come from different clip directories (--eval-dataset),
+    # and hf_build_dataset.py's manifest columns (audio/text/source/duration)
+    # differ from sm_04's (audio/text/video_id/start/duration/confidence) -- a
+    # single remove_columns list across both splits breaks the moment they diverge
+    ds["train"] = ds["train"].map(make_prepare(clips_dir), remove_columns=ds["train"].column_names,
+                                   num_proc=1, desc="extracting log-mel features (train)")
+    ds["validation"] = ds["validation"].map(make_prepare(eval_clips_dir),
+                                             remove_columns=ds["validation"].column_names,
+                                             num_proc=1, desc="extracting log-mel features (validation)")
 
     class DataCollatorSpeechSeq2SeqWithPadding:
         def __call__(self, features):
@@ -217,18 +267,23 @@ def main():
     model.config.use_cache = False  # required with gradient checkpointing
 
     if args.use_lora:
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, PeftModel, get_peft_model
 
         # gradient checkpointing freezes the frozen base's input grads, which
         # would stop gradients ever reaching the adapters -- re-enable them
         model.enable_input_require_grads()
-        model = get_peft_model(model, LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "v_proj"],  # standard Whisper LoRA target set
-            bias="none",
-        ))
+        if args.init_adapter:
+            print(f"warm-starting LoRA weights from {args.init_adapter} "
+                  f"(optimizer/scheduler state not restored -- lr={args.lr})", file=sys.stderr)
+            model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+        else:
+            model = get_peft_model(model, LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=["q_proj", "v_proj"],  # standard Whisper LoRA target set
+                bias="none",
+            ))
         model.print_trainable_parameters()
 
     training_args = Seq2SeqTrainingArguments(
