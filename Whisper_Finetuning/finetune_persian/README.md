@@ -1,0 +1,273 @@
+# Persian Whisper fine-tuning on Modal
+
+Fine-tunes `AmirMohseni/whisper-large-v3-persian-bf16` with LoRA and converts the
+result to the CTranslate2 int8 format `asr_engine.py` serves in production.
+
+Everything runs on [Modal](https://modal.com) (serverless GPU). You need no local
+GPU, and no data on your machine — the pipeline pulls its audio from public
+Hugging Face datasets.
+
+`modal_app.py` is a thin orchestration layer: every stage shells out to the same
+scripts you would run locally, so nothing here is Modal-specific except where to
+run it and on what hardware.
+
+---
+
+## Quick start
+
+```bash
+pip install modal
+modal setup          # opens a browser to link your Modal account
+```
+
+```bash
+cd Whisper_Finetuning/finetune_persian
+modal run --detach modal_app.py
+```
+
+That runs the whole thing: build a ~6h dataset → LoRA fine-tune on an A10G →
+merge and convert to CT2 → score WER. Expect **~3–4 hours**, most of it training.
+
+No secrets are required. The datasets and the base model are public.
+
+Download the finished model:
+
+```bash
+modal volume get whisper-persian-data models/whisper-persian-ct2-int8 ./models
+export CT2_MODEL_DIR=$PWD/models/whisper-persian-ct2-int8
+```
+
+`asr_engine.py` reads `CT2_MODEL_DIR` — no code change needed to serve it.
+
+---
+
+## Results from the reference run
+
+6,748 clips / 6.0h of audio, LoRA, 3 epochs, ~2.4h on an A10G:
+
+| Stage | WER |
+|---|---|
+| eval @ step 200 | 31.85% |
+| eval @ step 600 | 27.28% |
+| eval @ step 1140 (final) | 25.22% |
+| **converted CT2 model, 500 held-out clips** | **23.35%** (CER 12.53%) |
+
+Per-source breakdown of that final number:
+
+| Source | Clips | WER | CER |
+|---|---:|---:|---:|
+| `bplus_podcast` | 83 | 9.45% | 3.49% |
+| `movarekhpodcast` | 90 | 10.69% | 2.85% |
+| `channelbpodcast` | 117 | 18.80% | 7.96% |
+| `Tabaghe16` | 54 | 20.05% | 9.97% |
+| `youtube-farsi` | 31 | 23.26% | 11.51% |
+| `kouman` | 125 | 51.10% | 33.93% |
+
+**Run-to-run variance is real.** Two evals of the same model over the same
+seed-fixed subset gave 23.35%/12.53% and 23.65%/13.75%. That spread is
+non-determinism in `int8_float16` GPU inference. Treat results as ~23.5% ± a few
+tenths; don't read a 0.3pp "improvement" as signal.
+
+---
+
+## Stages
+
+Each is independently runnable — `modal run modal_app.py::<stage>`. All output
+lands on the persistent volume `whisper-persian-data`, so a stage never redoes
+the previous one's work.
+
+| Stage | Hardware | Writes | Notes |
+|---|---|---|---|
+| `build_hf_dataset` | 8 CPU | `/data/collection` | streams HF repos, ~1h audio each |
+| `train` | A10G | `/data/run1` | LoRA, 3 epochs |
+| `convert` | 4 CPU / 32GB | `/data/models/...` | merges adapter, quantizes |
+| `evaluate` | T4 | — | WER/CER + per-source table |
+| `diagnose_source` | T4 | — | why is one source scoring badly |
+| `text_hygiene` | CPU | — | annotation/chars-per-sec audit |
+
+Scaling up (see [Scaling](#scaling) below):
+
+| Stage | Hardware | Writes |
+|---|---|---|
+| `build_one_repo` | 4 CPU | `/data/full/<tag>` |
+| `blend` | 4 CPU / 32GB | `/data/blend` |
+| `train_big` | A10G | `/data/run_big` |
+
+Useful flags:
+
+```bash
+# more audio per repo (default 3600s of kept audio each)
+modal run modal_app.py --max-seconds-per-repo 7200
+
+# one repo only
+modal run modal_app.py --repos "MohammadGholizadeh/youtube-farsi:transcription:train"
+```
+
+---
+
+## Where the data comes from
+
+Public Persian YouTube/podcast corpora — the
+[MohammadGholizadeh collection](https://huggingface.co/collections/MohammadGholizadeh/persian-youtube-asr-datasets),
+which is what `hf_build_dataset.py` was written against. Six repos, ~713h total,
+~260GB of parquet. It is **streamed**, and `--max-seconds-per-repo` stops each
+stream once it has enough — without that budget you would pull all 260GB.
+
+Only `youtube-farsi` has a `video_id`, so it gets a proper held-out-by-recording
+validation split. The podcast repos are a single `train` split with no recording
+id, so they are tail-sliced — same speaker on both sides, which is weaker but is
+what is available without re-diarizing.
+
+### Why not the original YouTube data
+
+`sm_data/links.jsonl` is dead and cannot rebuild a dataset from any machine:
+
+- 6 of 14 links time out (`cdn.imgurl.ir`)
+- 6 return HTTP 403 (`uupload.ir`) — not fixable with a browser UA, a `Referer`,
+  or percent-encoding the `+` in the paths; all were tried
+- `val_a/b/c` have transcripts but **no entry in `links.jsonl` at all**, so the
+  validation split has no audio source either way
+
+The `sm_*` stages (`seed_data`, `download_audio`, `transcribe`, `build_dataset`)
+are still wired up for the day those links come back. If you have the `.m4a`
+files, `modal volume put whisper-persian-data ./audio /audio` skips the dead
+links entirely and the original `sm_04` path runs unchanged.
+
+### Data quality: `kouman`
+
+`kouman` scores 51% WER against 9–23% for every other source. It is **not**
+misaligned — most of its refs transcribe almost exactly. The damage is:
+
+- **11.7%** of rows are non-speech stage directions in asterisks
+  (`* applause *`, on-screen text). Those words are not in the audio, so they
+  are ~100% WER however good the model gets, and training on them teaches the
+  model to invent text nobody said.
+- **24%** of rows exceed 20 chars/second — faster than the clip is long, i.e.
+  on-screen text again.
+
+`hf_build_dataset.py --drop-annotations --max-chars-per-sec 25` removes both
+(measured on kouman: 18/114 rows dropped as annotation, 1 as too fast, 95 kept).
+The scaling stages pass these by default.
+
+Asterisks are a safe marker — they appear nowhere else in these transcripts.
+**Brackets deliberately are not filtered**: `youtube-farsi` uses `[میزبان:]` for
+speaker labels (noise) but `(BPM)` for spoken parentheticals (not noise).
+
+---
+
+## Scaling
+
+The reference run uses 1h per repo. To go bigger:
+
+```bash
+modal run --detach modal_app.py::build_all      # ~275h, 6 repos in parallel, then blend
+modal run --detach modal_app.py::train_big      # trains on a sample of the blend
+```
+
+`build_all` runs one container per repo. The build is a sequential
+decode-and-write loop, so running six concurrently turns a ~27h job into one
+bounded by its longest single repo.
+
+**GPU time, not disk, is the binding constraint.** The A10G measures ~7.6 s/step
+at batch 8 / grad-accum 2:
+
+| Clips | Epochs | Steps | Approx A10G time |
+|---:|---:|---:|---|
+| 80,000 | 1 | ~5,000 | ~11h |
+| 300,000 (full ~275h build) | 1 | ~19,000 | ~40h — **over the 24h function timeout** |
+
+So `train_big` defaults to `--max-train-samples 80000`. That shuffles with the
+seed *before* selecting, so it is a real sample across all six sources and is
+stable between runs. The rest of the corpus stays on the volume for later runs.
+
+A bigger GPU needs a payment method on the Modal account:
+
+```bash
+BIG_GPU=A100-80GB modal run --detach modal_app.py::train_big --batch-size 24
+```
+
+If you do move to an A100/H100, note that `train_whisper.py` hardcodes
+`fp16=torch.cuda.is_available()`, and its comment explains why: a T4 has no
+native bf16. On an A100/H100 that reasoning inverts — bf16 is native and the base
+checkpoint is already bf16 — so getting full value from the card means editing
+that line, not just changing `gpu=`.
+
+---
+
+## Gotchas
+
+Each of these cost a run. They are all in `modal_app.py` with comments; this is
+the short version.
+
+**A missing resource aborts the entire app, not just the stage that needs it.**
+Modal hydrates *every* registered function at startup. A `Secret.from_name` for a
+secret you never created, or a `gpu=` your workspace is not entitled to, kills
+`modal run ...::train` too — a stage that never touches either. Worse, it usually
+surfaces as a bare `CancelledError`, because the concurrent image build gets
+cancelled before the real `NotFoundError` can print. If you get an instant
+`CancelledError` with no useful message, suspect this first, and bisect by
+running a trivial function. Both known cases are opt-in here
+(`ENABLE_TRANSCRIBE=1`, `BIG_GPU=`).
+
+**`ctranslate2` needs CUDA 12; torch now ships CUDA 13.** `libcublas.so.13`
+exists, `libcublas.so.12` is what gets dlopened — at the *first encode*, long
+after the model loads cleanly. Both runtimes are installed side by side and put
+on `LD_LIBRARY_PATH`. That variable is read by the dynamic loader at process
+start, so it is set on the image (not just in `_run`) for anything importing
+`ctranslate2` in-process.
+
+**`train_whisper.py` requires `tensorboard`** via `report_to=["tensorboard"]`, or
+the Trainer raises before step 1.
+
+**`--detach` keeps only the *last* triggered function alive.** A single
+entrypoint chaining build → blend → train can lose the tail when the local
+process goes away, which is why `build_all` and `train_big` are separate.
+
+**Training progress does not stream reliably.** Output buffers through the
+detached CLI and can look stalled for an hour while everything is fine. Check the
+volume instead:
+
+```bash
+modal volume ls whisper-persian-data run1       # checkpoints appearing = progress
+modal app list                                  # task count > 0 = still running
+```
+
+To read live metrics, pull the newest checkpoint's `trainer_state.json` — its
+`log_history` has every loss and eval WER.
+
+**Beware over-filtering your own log output.** A `grep -E "WER|CER|clips"` over
+the eval output passes the per-source *header* (it contains those words) and
+drops every data row beneath it, which looks exactly like a bug in the eval
+script. It is not.
+
+---
+
+## Costs
+
+Rough shape of the reference run (check
+[Modal's pricing](https://modal.com/pricing) for current rates):
+
+- image build: ~80s, once, then cached
+- dataset build (6h audio): ~30 min on CPU
+- training: ~2.4h on one A10G
+- convert + evaluate: ~15 min
+
+The free tier covers the A10G. A100/H100 requires a payment method.
+
+---
+
+## Local / non-Modal use
+
+Every script runs standalone; `modal_app.py` only chooses where. See each
+script's module docstring for its flags. The pipeline order is:
+
+```
+sm_01_extract_links → sm_02_download → sm_03_transcribe → sm_04_build_dataset ─┐
+                                        (or sm_03b_import_transcripts)         │
+                                                                               ├→ train_whisper → convert_to_ct2 → eval_baseline
+hf_build_dataset (Hugging Face sources) ───────────────────────────────────────┘
+                                    ↑ blend_datasets merges multiple of these
+```
+
+Diagnostics: `report_run.py` (training curves), `peek_checkpoint.py` (mid-run
+sanity check), `diagnose_ct2.py` (inspect a converted model).

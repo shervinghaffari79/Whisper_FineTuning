@@ -73,6 +73,11 @@ def main():
     parser.add_argument("--merged-dir", default=None,
                         help="where to write the merged checkpoint when converting a "
                         "LoRA adapter (default: <out_dir>_merged)")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite out_dir if it already exists. Without this, "
+                        "ct2-transformers-converter refuses ('output directory already "
+                        "exists') and a re-run of this step fails after the LoRA merge "
+                        "has already been paid for")
     args = parser.parse_args()
 
     # Keep the ORIGINAL string for the hub path: a repo id is "owner/name" with
@@ -124,6 +129,8 @@ def main():
         "--output_dir", args.out_dir,
         "--quantization", args.quantization,
     ]
+    if args.force:
+        cmd.append("--force")
     # --copy_files is nargs="+" on the converter side, so passing the flag with
     # no values is an argparse error rather than a no-op
     if copy_files:

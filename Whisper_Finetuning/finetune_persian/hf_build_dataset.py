@@ -36,6 +36,7 @@ container soundfile can't decode directly.
 import argparse
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -143,6 +144,23 @@ def main():
     )
     parser.add_argument("--min-sec", type=float, default=0.3)
     parser.add_argument("--max-sec", type=float, default=28.0)
+    parser.add_argument(
+        "--drop-annotations", action="store_true",
+        help="drop rows whose text contains '*'. Some sources (kouman) wrap "
+        "non-speech stage directions in asterisks -- '* applause *', on-screen "
+        "text -- whose words are NOT in the audio. They are ~100%% WER no matter "
+        "how good the model gets, and training on them teaches hallucination. "
+        "Asterisks do not otherwise occur in these transcripts, so this is a "
+        "safe marker; brackets are NOT, since '[host:]' is noise but '(BPM)' "
+        "is spoken",
+    )
+    parser.add_argument(
+        "--max-chars-per-sec", type=float, default=None,
+        help="drop rows whose text is too long to have been spoken in the clip's "
+        "duration -- catches on-screen text and audio/text misalignment "
+        "regardless of punctuation convention. The clean sources here sit at a "
+        "p95 of 15-20; 25 is conservative",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -160,7 +178,7 @@ def main():
         has_named_val = split in ("validation", "val", "test")
         id_col = None if args.id_column == "none" else args.id_column
         rows, total_sec = [], 0.0
-        n_scanned = n_empty = n_dur = 0
+        n_scanned = n_empty = n_dur = n_annot = n_fast = 0
         hit_budget = False
         for i, row in enumerate(ds):
             if args.max_seconds_per_repo and total_sec >= args.max_seconds_per_repo:
@@ -175,11 +193,18 @@ def main():
             if not text:
                 n_empty += 1
                 continue
+            # cheap text-only reject, before paying for the decode
+            if args.drop_annotations and "*" in text:
+                n_annot += 1
+                continue
             audio, sr = decode_row_audio(row["audio"])
             audio = resample_if_needed(audio, sr)
             dur = len(audio) / SAMPLE_RATE
             if dur < args.min_sec or dur > args.max_sec:
                 n_dur += 1
+                continue
+            if args.max_chars_per_sec and len(text) / dur > args.max_chars_per_sec:
+                n_fast += 1
                 continue
             name = f"{tag}_{i:06d}.wav"
             sf.write(clips_dir / name, audio, SAMPLE_RATE)
@@ -203,7 +228,8 @@ def main():
         # opposite responses (raise the budget vs loosen the filters).
         print(f"[{tag}] scanned {n_scanned} rows -> kept {len(rows)}"
               f" (dropped {n_empty} empty-text, {n_dur} outside "
-              f"{args.min_sec}-{args.max_sec}s)", file=sys.stderr)
+              f"{args.min_sec}-{args.max_sec}s, {n_annot} annotation, "
+              f"{n_fast} over {args.max_chars_per_sec} chars/s)", file=sys.stderr)
         if hit_budget:
             print(f"[{tag}] STOPPED at the --max-seconds-per-repo budget "
                   f"({args.max_seconds_per_repo:.0f}s) -- the repo has more available; "
@@ -265,3 +291,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Streaming leaves background threads alive (the fsspec/aiohttp readers
+    # behind load_dataset(streaming=True)), and on interpreter shutdown one of
+    # them can touch the GIL after finalization has begun:
+    #     Fatal Python error: PyGILState_Release: auto-releasing thread-state,
+    #     but no thread-state for this thread
+    # The process dies with SIGABRT *after* every clip, the manifest and the
+    # dataset are written and this script has printed its summary -- so the
+    # build has fully succeeded and the caller still sees a crash. Everything is
+    # flushed by this point, so skip interpreter finalization rather than race
+    # it. An exception inside main() still propagates normally and exits
+    # non-zero; only a completed build takes this path.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

@@ -249,10 +249,19 @@ def main():
         cut = max(1, len(train_rows) // 10)
         val_rows, train_rows = train_rows[-cut:], train_rows[:-cut]
 
-    DatasetDict({
-        "train": Dataset.from_list(train_rows),
-        "validation": Dataset.from_list(val_rows),
-    }).save_to_disk(str(out_dir / "hf_dataset"))
+    # Only emit splits that actually have rows, the same way hf_build_dataset.py
+    # does. An empty split SAVES without complaint and then cannot be loaded --
+    # load_from_disk raises "IndexError: list index out of range" concatenating
+    # zero shards, which points at the reader rather than at this build. Holding
+    # every recording out (--val-fraction 1.0) is a legitimate way to produce a
+    # validation-only set for --eval-dataset, and that is exactly the case that
+    # leaves train empty.
+    splits = {}
+    if train_rows:
+        splits["train"] = Dataset.from_list(train_rows)
+    if val_rows:
+        splits["validation"] = Dataset.from_list(val_rows)
+    DatasetDict(splits).save_to_disk(str(out_dir / "hf_dataset"))
 
     total_h = sum(r["duration"] for r in rows) / 3600
     print()
