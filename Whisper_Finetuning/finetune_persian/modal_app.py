@@ -85,7 +85,7 @@ DEFAULT_HF_REPOS = ",".join([
 
 volume = modal.Volume.from_name("whisper-persian-data", create_if_missing=True)
 
-image = (
+_base = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
     .pip_install(
@@ -104,50 +104,59 @@ image = (
         "nvidia-cublas-cu12",
         "nvidia-cudnn-cu12>=9",
     )
-    # _run() sets this for subprocesses, but the dynamic loader reads
-    # LD_LIBRARY_PATH at process START -- so anything importing ctranslate2
-    # in-process (the diagnostics below) needs it set on the container itself.
-    .env({
-        "LD_LIBRARY_PATH": ":".join([
-            f"{SITE}/nvidia/cublas/lib",
-            f"{SITE}/nvidia/cudnn/lib",
-            f"{SITE}/nvidia/cu13/lib",
-        ])
-    })
-    .add_local_dir(
-        str(LOCAL_DIR),
-        remote_path=CODE,
-        ignore=["sm_data/audio", "sm_data/dataset", "run*", "models",
-                "__pycache__", "*.pyc", ".DS_Store"],
-    )
+)
+
+_LOCAL = dict(
+    remote_path=CODE,
+    ignore=["sm_data/audio", "sm_data/dataset", "sm_data/transcripts/val_audio",
+            "run*", "models", "__pycache__", "*.pyc", ".DS_Store"],
 )
 
 
-def _run(cmd):
-    import glob
+# The CUDA-12 loader path, needed ONLY by ctranslate2/faster-whisper. Keep it
+# off every other stage: putting it on the CPU-only dataset builds pulls torch's
+# CUDA bindings into a container with no GPU, and the streaming build then dies
+# at interpreter shutdown with
+#   Fatal Python error: PyGILState_Release: thread state must be current
+# -- AFTER writing all its output and printing its summary. The stage reports
+# SIGABRT and looks like a build failure when the build actually succeeded.
+CUDA_LD_PATH = ":".join([
+    f"{SITE}/nvidia/cublas/lib",
+    f"{SITE}/nvidia/cudnn/lib",
+    f"{SITE}/nvidia/cu13/lib",
+])
+
+
+# add_local_dir must be the LAST step of an image -- Modal rejects a build step
+# after it -- so both variants branch from _base and add the code at the end,
+# rather than gpu_image deriving from image.
+image = _base.add_local_dir(str(LOCAL_DIR), **_LOCAL)
+
+# Same image with the CUDA-12 loader path baked in, for the stages that import
+# ctranslate2 IN-PROCESS. LD_LIBRARY_PATH is read by the dynamic loader at
+# process start, so setting it inside the function would be too late.
+gpu_image = _base.env({"LD_LIBRARY_PATH": CUDA_LD_PATH}).add_local_dir(
+    str(LOCAL_DIR), **_LOCAL
+)
+
+
+def _run(cmd, cuda: bool = False):
+    """cuda=True adds the CUDA-12 runtime to the subprocess loader path.
+
+    Only ctranslate2 needs it: it dlopens libcublas/libcudnn at the first
+    encode, and torch's pip-installed CUDA libs live under
+    site-packages/nvidia/*/lib, which is not on the default loader path --
+    without it faster-whisper loads the model cleanly and then dies with
+    "Library libcublas.so.12 is not found". torch finds its own libs unaided,
+    so training does not need this.
+    """
     import subprocess
 
     env = dict(os.environ)
-    # ctranslate2 (under faster-whisper) dlopens libcublas/libcudnn at the first
-    # encode, but the CUDA libs installed as torch's pip deps live under
-    # site-packages/nvidia/*/lib, which is not on the loader path. Without this
-    # the model loads fine and then dies mid-transcribe with
-    # "Library libcublas.so.12 is not found or cannot be loaded".
-    try:
-        import nvidia
-
-        # a namespace package: __file__ is None, the roots are in __path__
-        libs = sorted(
-            d
-            for base in list(getattr(nvidia, "__path__", []))
-            for d in glob.glob(os.path.join(base, "*", "lib"))
+    if cuda:
+        env["LD_LIBRARY_PATH"] = ":".join(
+            [CUDA_LD_PATH] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
         )
-        if libs:
-            env["LD_LIBRARY_PATH"] = ":".join(
-                libs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
-            )
-    except ImportError:
-        pass
 
     print("+", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, env=env)
@@ -299,6 +308,37 @@ def build_dataset():
     volume.commit()
 
 
+@app.function(image=image, volumes={DATA: volume}, cpu=4.0, timeout=3 * 3600)
+def build_val_dataset(out: str = f"{DATA}/val_domain"):
+    """Build the real target-domain recordings (val_a/b/c) into a
+    validation-ONLY dataset, for use as train_whisper.py --eval-dataset and as
+    an eval_baseline.py target.
+
+    These three are the only recordings whose audio survived, so they are worth
+    far more as a held-out measure of the actual use case than as a few minutes
+    of extra training data. Aggregate WER over public podcasts says nothing
+    about how the model handles this audio.
+
+    Two things this has to steer around in sm_04_build_dataset.py:
+      - it treats <transcripts>/val as held out, and since these are the only
+        recordings with audio, every video would land in validation and it
+        exits with "every video is in validation; nothing left to train on".
+        So point --transcripts AT the val folder and send --val-dir somewhere
+        that does not exist, which puts all three on the val-fraction path.
+      - --val-fraction 1.0 then rounds to every video, so the build is pure
+        validation with an empty train split, which is what --eval-dataset
+        reads.
+    """
+    cmd = ["python", f"{CODE}/sm_04_build_dataset.py",
+           "--audio", f"{DATA}/audio",
+           "--transcripts", f"{DATA}/sm_data/transcripts/val",
+           "--val-dir", f"{DATA}/__no_such_dir__",
+           "--val-fraction", "1.0",
+           "--out", out]
+    _run(cmd)
+    volume.commit()
+
+
 @app.function(
     image=image,
     volumes={DATA: volume},
@@ -312,18 +352,32 @@ def train(
     dataset: str = f"{DATA}/collection/hf_dataset",
     max_eval_samples: int = 256,
     early_stopping_patience: int = 3,
+    eval_steps: int = 200,
+    max_train_samples: int = 0,
+    out: str = f"{DATA}/run1",
 ):
+    """eval_steps and max_train_samples exist so the whole pipeline can be
+    smoke-tested in minutes instead of hours.
+
+    Keep eval_steps BELOW the total step count on a short run. Trainer is
+    configured with load_best_model_at_end and metric_for_best_model="wer", so a
+    run that finishes without ever reaching an eval has no best checkpoint to
+    load and fails at the very end -- after paying for all the training.
+    """
     cmd = ["python", f"{CODE}/train_whisper.py",
            "--dataset", dataset,
-           "--out", f"{DATA}/run1",
+           "--out", out,
            "--epochs", str(epochs),
            "--batch-size", str(batch_size),
+           "--eval-steps", str(eval_steps),
            # eval runs generate() over every clip and can cost more wall clock
            # than the training it measures; the script's own guidance is that
            # 128-256 clips track full-set WER closely enough to pick a checkpoint
            "--max-eval-samples", str(max_eval_samples),
            "--early-stopping-patience", str(early_stopping_patience),
            "--progress", "never"]
+    if max_train_samples:
+        cmd += ["--max-train-samples", str(max_train_samples)]
     if use_lora:
         cmd.append("--use-lora")
     _run(cmd)
@@ -384,9 +438,14 @@ def train_big(epochs: float = 1.0, batch_size: int = 8,
 # discovering the OOM after training has already been paid for
 @app.function(image=image, volumes={DATA: volume}, cpu=4.0, memory=32768, timeout=3600)
 def convert():
+    # --force so the stage is re-runnable: the converter refuses to write into an
+    # existing output dir, which otherwise makes every convert after the first
+    # one fail -- and it fails AFTER redoing the LoRA merge. The output is
+    # regenerable from run1/final, so overwriting is the right default here.
     cmd = ["python", f"{CODE}/convert_to_ct2.py",
            f"{DATA}/run1/final",
-           f"{DATA}/models/whisper-persian-ct2-int8"]
+           f"{DATA}/models/whisper-persian-ct2-int8",
+           "--force"]
     _run(cmd)
     volume.commit()
 
@@ -394,17 +453,20 @@ def convert():
 # convert() emits int8_float16, which is the CUDA quantization -- scoring it on
 # CPU would make faster-whisper fall back and measure something other than what
 # production serves, so eval gets a GPU too (a T4 is plenty for decoding)
-@app.function(image=image, volumes={DATA: volume}, gpu="T4", timeout=1800)
+# 2h, not the 1800s this started at: decoding runs ~2 s/clip on a T4, so a
+# full 959-clip held-out set needs ~32 min and the old cap killed it at 850 --
+# after 28 minutes of GPU time, with no report written.
+@app.function(image=gpu_image, volumes={DATA: volume}, gpu="T4", timeout=2 * 3600)
 def evaluate(dataset: str = f"{DATA}/collection/hf_dataset", limit: int = 500):
     cmd = ["python", f"{CODE}/eval_baseline.py",
            "--model", f"{DATA}/models/whisper-persian-ct2-int8",
            "--dataset", dataset,
            "--split", "validation",
            "--limit", str(limit)]
-    _run(cmd)
+    _run(cmd, cuda=True)
 
 
-@app.function(image=image, volumes={DATA: volume}, gpu="T4", timeout=1800)
+@app.function(image=gpu_image, volumes={DATA: volume}, gpu="T4", timeout=1800)
 def diagnose_source(source: str = "kouman_dataset_persian", n: int = 10,
                     dataset: str = f"{DATA}/collection/hf_dataset"):
     """Why does one source score far worse than its peers? Three causes look

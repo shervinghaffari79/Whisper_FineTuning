@@ -36,6 +36,7 @@ container soundfile can't decode directly.
 import argparse
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -290,3 +291,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Streaming leaves background threads alive (the fsspec/aiohttp readers
+    # behind load_dataset(streaming=True)), and on interpreter shutdown one of
+    # them can touch the GIL after finalization has begun:
+    #     Fatal Python error: PyGILState_Release: auto-releasing thread-state,
+    #     but no thread-state for this thread
+    # The process dies with SIGABRT *after* every clip, the manifest and the
+    # dataset are written and this script has printed its summary -- so the
+    # build has fully succeeded and the caller still sees a crash. Everything is
+    # flushed by this point, so skip interpreter finalization rather than race
+    # it. An exception inside main() still propagates normally and exits
+    # non-zero; only a completed build takes this path.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
