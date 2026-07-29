@@ -69,12 +69,46 @@ def _ensure():
     else:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # CHAT_DEVICE forces cpu on a GPU box: the 4B fp16 weights are ~8GB, and
+        # on a 16GB card that is more than half the board held for a panel that
+        # is used on demand. CPU generation is much slower but leaves the GPU
+        # entirely to ASR/diarization.
+        want = os.environ.get("CHAT_DEVICE", "auto").lower()
+        if want in ("cuda", "cpu"):
+            device = want
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
         _TOK = AutoTokenizer.from_pretrained(HF_MODEL)
         _MODEL = AutoModelForCausalLM.from_pretrained(HF_MODEL, torch_dtype=dtype).to(device)
         _MODEL.eval()
     return _MODEL, _TOK, _TMPL
+
+
+def unload() -> bool:
+    """Drop the chat model and free its GPU memory. Returns True if something
+    was actually unloaded.
+
+    _ensure() caches the model for the process lifetime, so once the AI Analysis
+    panel has been used once, ~8GB stays occupied for every subsequent
+    transcription -- which is what pushes long files into CUDA OOM. Transcription
+    calls this first; the next chat request reloads lazily (a few seconds).
+
+    A generation already in flight keeps its own reference, so this is safe to
+    call concurrently -- that memory just frees when the stream finishes."""
+    global _MODEL, _TOK, _TMPL
+    if _MODEL is None:
+        return False
+    _MODEL = _TOK = _TMPL = None
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return True
 
 
 def _system_prompt(transcript: str) -> str:

@@ -71,6 +71,38 @@ def _log(msg, cb=None):
         cb(msg)
 
 
+def _free_gpu():
+    """Hand cached-but-unused GPU blocks back to the driver.
+
+    PyTorch's caching allocator keeps freed memory reserved for reuse, and
+    CTranslate2 (Whisper) allocates OUTSIDE that pool -- so memory pyannote has
+    finished with is not visible to Whisper until this is called. Cheap enough
+    to run between stages."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _unload_pyannote():
+    """Drop the cached diarization pipeline and free its memory.
+
+    Diarization finishes entirely before the ASR loop begins, so on a card that
+    cannot hold both, keeping pyannote resident buys nothing for the current job
+    -- it only saves reload time on the NEXT one. Opt-in via PYANNOTE_UNLOAD=1."""
+    global _PYANNOTE, _PYANNOTE_TRIED
+    if _PYANNOTE is None:
+        return
+    _PYANNOTE = None
+    _PYANNOTE_TRIED = False  # allow a reload on the next job
+    import gc
+    gc.collect()
+    _free_gpu()
+    print("[mem] unloaded pyannote after diarization", file=sys.stderr, flush=True)
+
+
 def decode_audio(path: str) -> np.ndarray:
     """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
     cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
@@ -165,7 +197,14 @@ def _load_pyannote():
                 file=sys.stderr, flush=True,
             )
             return None
-        if torch.cuda.is_available():
+        # PYANNOTE_DEVICE=cpu keeps diarization off the GPU entirely -- slower,
+        # but its memory then comes out of system RAM instead of competing with
+        # Whisper for the card. The escape hatch for files that OOM regardless
+        # of batch size.
+        want = os.environ.get("PYANNOTE_DEVICE", "auto").lower()
+        if want == "cpu":
+            gpu_device = None
+        elif torch.cuda.is_available():
             gpu_device = torch.device("cuda")
         elif torch.backends.mps.is_available():
             gpu_device = torch.device("mps")
@@ -177,6 +216,26 @@ def _load_pyannote():
             except Exception as e:
                 print(f"[diarize] pyannote loaded but failed to move to {gpu_device}: "
                      f"{type(e).__name__}: {e} -- continuing on CPU", file=sys.stderr, flush=True)
+
+        # Peak diarization memory is set by how many sliding windows pyannote
+        # batches at once, NOT by the model size -- which is why short files are
+        # fine and long ones OOM: a 2h recording produces thousands of windows
+        # and the default batch (32) sizes the activation buffers accordingly.
+        # Lowering it trades a little speed for a footprint that stops growing
+        # with file length. hasattr-guarded because these attribute names differ
+        # between pyannote 3.x and 4.x.
+        batch = int(os.environ.get("PYANNOTE_BATCH", "8"))
+        applied = []
+        for attr in ("segmentation_batch_size", "embedding_batch_size"):
+            if hasattr(pipe, attr):
+                try:
+                    setattr(pipe, attr, batch)
+                    applied.append(attr)
+                except Exception:
+                    pass
+        if applied:
+            print(f"[diarize] batch size {batch} applied to {', '.join(applied)}",
+                  file=sys.stderr, flush=True)
         print("[diarize] pyannote/speaker-diarization-3.1 loaded successfully "
              f"(device={gpu_device or 'cpu'})", file=sys.stderr, flush=True)
         _PYANNOTE = pipe
@@ -317,6 +376,13 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                      "continuing with no speaker separation", file=sys.stderr, flush=True)
                 turns = None
         print(f"[diarize] this run used: {diarizer_used}", file=sys.stderr, flush=True)
+        # Diarization is done with the GPU from here on -- the ASR loop below is
+        # the only consumer left. Release what it was holding before Whisper
+        # starts allocating, otherwise the two peaks overlap for no reason.
+        if os.environ.get("PYANNOTE_UNLOAD", "0") == "1":
+            _unload_pyannote()
+        else:
+            _free_gpu()
 
     # transcribe chunk-by-chunk, assigning the speaker (by overlap) and emitting
     # each finished segment immediately so the UI can stream the transcript.

@@ -85,6 +85,12 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
 
     try:
         _set(job_id, state="processing", progress=2, message="Starting…", partial=[])
+        # The chat LLM caches ~8GB of fp16 weights for the process lifetime once
+        # the AI Analysis panel has been used. On a 16GB card that is what turns
+        # a long file into a CUDA OOM -- ASR + diarization are left under half
+        # the board. Drop it here; the next /api/chat request reloads it lazily.
+        if chat.unload():
+            print("[mem] unloaded chat model to free GPU for transcription", flush=True)
         result = pipeline.transcribe(tmp_path, diarize=diarize, progress=progress,
                                      on_segment=on_segment, correct_fn=correct_fn)
         result["id"] = job_id
