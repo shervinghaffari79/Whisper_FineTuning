@@ -15,3 +15,8 @@ Whisper_Finetuning/finetune_persian/sm_data/*
 !Whisper_Finetuning/finetune_persian/sm_data/links.jsonl
 !Whisper_Finetuning/finetune_persian/sm_data/urls.txt
 !Whisper_Finetuning/finetune_persian/sm_data/transcripts/
+
+# the validation audio itself -- bulk data like the rest of sm_data. The
+# transcripts beside it are the reproducible input and stay tracked, but the
+# !transcripts/ rule above would otherwise sweep this 143MB of mp3 in with them.
+Whisper_Finetuning/finetune_persian/sm_data/transcripts/val_audio/

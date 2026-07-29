@@ -106,8 +106,14 @@ def main():
             continue
         refs.append(ref_n)
         hyps.append(hyp_n)
+        # hf_build_dataset.py/blend_datasets.py name the origin "source"; the
+        # sm_04 path has no such column and identifies the recording by
+        # "video_id" instead. Falling back keeps the per-origin breakdown
+        # working for both, which for an sm_04 build means one row per
+        # recording -- exactly the split you want when the held-out set is a
+        # handful of distinct speakers rather than one blended corpus.
         rows.append({"audio": ex["audio"], "ref": ex["text"], "hyp": hyp,
-                     "source": ex.get("source")})
+                     "source": ex.get("source") or ex.get("video_id")})
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(ds)}  ({(time.time() - t0) / (i + 1):.2f}s/clip)", file=sys.stderr)
 
