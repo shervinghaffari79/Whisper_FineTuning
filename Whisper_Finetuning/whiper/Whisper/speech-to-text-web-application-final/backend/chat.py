@@ -151,8 +151,9 @@ def _system_prompt(transcript: str) -> str:
             "- Keep answers brief and to the point\n"
             "- Reference specific speakers (S1, S2, S3, …) when relevant\n"
             "- When you state something the transcript says, cite EXACTLY where by copying "
-            "that line's timestamp in brackets, e.g. [04:12] -- copy the digits verbatim from "
-            "the transcript, do not estimate or reformat them. This lets the user jump to and "
+            "that line's full bracket verbatim, e.g. [S1 04:12] -- copy it exactly as it "
+            "appears in the transcript above, speaker letter included; do not estimate, "
+            "reformat, or drop the speaker. This lets the user jump to and "
             "verify that moment, so include one whenever you reference a specific claim, "
             "decision, or quote -- not for general summaries with no single source line"
         )

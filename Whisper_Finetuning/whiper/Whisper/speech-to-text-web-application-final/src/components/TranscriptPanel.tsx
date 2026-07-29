@@ -188,9 +188,37 @@ export default function TranscriptPanel({
     return `${h}:${m}:${s},${ms}`;
   };
 
-  const activeSegmentIndex = transcription?.segments.findIndex(
-    s => currentTime >= s.start && currentTime <= s.end
-  ) ?? -1;
+  // Two reasons strict containment (currentTime >= s.start && <= s.end) can
+  // match no segment at all, which is exactly "I click and nothing gets
+  // selected":
+  //  - <audio>.currentTime snaps to the nearest decodable frame for
+  //    compressed formats (m4a/mp3/opus), landing tens of ms away from the
+  //    exact value a seek requested -- documented browser behaviour, not a
+  //    bug in the seek path itself.
+  //  - ASR segments are not always back-to-back: a silent gap between two
+  //    segments is ordinary, and a slightly-off landing position can fall
+  //    exactly in that gap, matching neither neighbour.
+  // Scanning from the END first resolves an exact-boundary tie (segment A
+  // ends where B starts) in favour of B, the one just entered, rather than
+  // the earlier segment that just finished. Falling back to the nearest
+  // segment within a short tolerance when nothing contains currentTime
+  // covers the frame-snap and gap cases without highlighting something
+  // arbitrary when the playhead is genuinely far from any segment.
+  const activeSegmentIndex = (() => {
+    const segs = transcription?.segments;
+    if (!segs || segs.length === 0) return -1;
+    for (let i = segs.length - 1; i >= 0; i--) {
+      if (currentTime >= segs[i].start && currentTime <= segs[i].end) return i;
+    }
+    const TOLERANCE = 1.5; // seconds
+    let best = -1, bestDist = Infinity;
+    segs.forEach((s, i) => {
+      const dist = currentTime < s.start ? s.start - currentTime
+                 : currentTime - s.end;
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    });
+    return bestDist <= TOLERANCE ? best : -1;
+  })();
 
   useEffect(() => {
     if (activeSegmentRef.current) {
