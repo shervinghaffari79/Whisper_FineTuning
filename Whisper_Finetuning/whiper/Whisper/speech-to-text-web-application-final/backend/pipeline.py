@@ -337,13 +337,71 @@ def _normalizer():
     return _NORMALIZER
 
 
-def _words_from(text, start, end, speaker):
+def _words_even(text, start, end, speaker):
+    """Fallback word list when the ASR backend gave us no alignment: spread the
+    segment's span evenly across its tokens.
+
+    These timings are INVENTED. They exist so the UI's word highlighting has
+    something to work with, and they are close enough for that at normal
+    speaking rates -- but they must never drive speaker assignment, because a
+    word's apparent position would then be an artifact of token count rather
+    than of when it was actually spoken."""
     toks = text.split()
     if not toks:
         return []
     step = (end - start) / len(toks)
     return [{"start": round(start + i * step, 2), "end": round(start + (i + 1) * step, 2),
-             "text": w, "speaker": speaker} for i, w in enumerate(toks)]
+             "text": w, "speaker": speaker, "estimated": True} for i, w in enumerate(toks)]
+
+
+def _split_on_speaker(words, turns, min_words=2):
+    """Group consecutive words into runs sharing a speaker.
+
+    This is the point of word timestamps: one ASR segment can span a speaker
+    change (someone interjects mid-sentence, or the VAD chunk straddles a
+    handover), and labelling the whole segment with a single overlap-winner
+    silently attributes one person's words to another.
+
+    Runs shorter than min_words are absorbed into the neighbouring run rather
+    than emitted. A single word flipping speaker is nearly always diarization
+    jitter at a turn boundary, and honouring it would shred the transcript into
+    unreadable one-word rows."""
+    if not words:
+        return []
+    labels = [_assign_speaker(w["start"], w["end"], turns) for w in words]
+
+    def group(labels):
+        runs = []  # [[speaker, [index, ...]], ...]
+        for i, spk in enumerate(labels):
+            if runs and runs[-1][0] == spk:
+                runs[-1][1].append(i)
+            else:
+                runs.append([spk, [i]])
+        return runs
+
+    # Absorb jitter by RELABELLING the offending words, then regrouping -- not
+    # by stitching runs together. Merging run objects directly leaves two
+    # adjacent runs carrying the same speaker when a short run in between is
+    # absorbed, which then emits as two segments from one person.
+    runs = group(labels)
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for idx, (spk, members) in enumerate(runs):
+            if len(members) >= min_words:
+                continue
+            prev_len = len(runs[idx - 1][1]) if idx > 0 else -1
+            next_len = len(runs[idx + 1][1]) if idx + 1 < len(runs) else -1
+            winner = runs[idx - 1][0] if prev_len >= next_len else runs[idx + 1][0]
+            if winner == spk:
+                continue
+            for i in members:
+                labels[i] = winner
+            runs = group(labels)
+            changed = True
+            break
+
+    return [[spk, [words[i] for i in members]] for spk, members in runs]
 
 
 def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
@@ -408,14 +466,14 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         _log(f"Transcribing {i+1}/{n}…", progress)
         if b - a < int(0.1 * SAMPLE_RATE):
             continue
-        chunk_segments = asr_engine.transcribe_chunk(audio[a:b], SAMPLE_RATE)
+        # Word timestamps cost an extra alignment pass, so only pay for them
+        # when diarization can actually use them to split a segment.
+        chunk_segments = asr_engine.transcribe_chunk(
+            audio[a:b], SAMPLE_RATE, word_timestamps=bool(turns))
         off = a / SAMPLE_RATE
-        for s in chunk_segments:
-            raw = s["text"].strip()
-            if not raw:
-                continue
-            st, en = round(off + s["start"], 2), round(off + s["end"], 2)
-            spk_raw = _assign_speaker(st, en, turns) if turns else "SPK0"
+
+        def _emit(spk_raw, st, en, raw, words, confidence):
+            """Label, normalize, optionally correct, and publish one segment."""
             if spk_raw not in label_map:
                 label_map[spk_raw] = f"S{len(label_map)+1}"
             spk = label_map[spk_raw]
@@ -428,13 +486,52 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                 # instead of defaulting to "[نامفهوم]" for lack of context.
                 context = "\n".join(recent_context[-4:])
                 text = correct_fn(text, spk, context)
+            if words is None:
+                # correct_fn may rewrite the text, so estimated timings have to
+                # be derived from the FINAL text rather than the raw tokens
+                words = _words_even(text, st, en, spk)
+            else:
+                words = [{**w, "speaker": spk} for w in words]
             seg = {"speaker": spk, "start": st, "end": en, "text": text,
-                   "words": _words_from(text, st, en, spk), "confidence": s.get("confidence")}
+                   "words": words, "confidence": confidence}
             segments.append(seg)
             if text:
                 recent_context.append(f"{spk}: {text}")
             if on_segment:
                 on_segment(seg)
+
+        for s in chunk_segments:
+            raw = s["text"].strip()
+            if not raw:
+                continue
+            st, en = round(off + s["start"], 2), round(off + s["end"], 2)
+            if not turns:
+                _emit("SPK0", st, en, raw, None, s.get("confidence"))
+                continue
+
+            # shift word times onto the full-recording timeline before they are
+            # compared against diarization turns, which are absolute
+            src_words = [{"start": round(off + w["start"], 2),
+                          "end": round(off + w["end"], 2),
+                          "text": w["text"].strip()}
+                         for w in (s.get("words") or []) if w["text"].strip()]
+            if not src_words:
+                # backend returned no alignment for this segment: fall back to
+                # labelling it whole, which is the old behaviour
+                _emit(_assign_speaker(st, en, turns), st, en, raw, None, s.get("confidence"))
+                continue
+
+            runs = _split_on_speaker(src_words, turns)
+            for spk_raw, ws in runs:
+                r_start = min(w["start"] for w in ws)
+                r_end = max(w["end"] for w in ws)
+                r_text = " ".join(w["text"] for w in ws).strip()
+                if not r_text:
+                    continue
+                # a split segment inherits the parent's confidence: avg_logprob
+                # is computed per ASR segment and cannot be re-derived per run
+                _emit(spk_raw, round(r_start, 2), round(r_end, 2), r_text, ws,
+                      s.get("confidence"))
 
     segments.sort(key=lambda s: s["start"])
     speakers = sorted({s["speaker"] for s in segments}, key=lambda x: int(x[1:]))

@@ -1,10 +1,11 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import {
   FileText, Download, Copy, Check, X, Search, Filter,
   Users, Clock, MessageSquare, AlignLeft,
 } from 'lucide-react';
 import { TranscriptionResult } from '../types';
 import { copyText } from '../utils/clipboard';
+import SpeakerManager from './SpeakerManager';
 
 // exp(avg_logprob) thresholds for the low/mid/high confidence dot -- these
 // are not calibrated probabilities (see asr_engine._confidence), just rough
@@ -23,6 +24,22 @@ const CONFIDENCE_DOT: Record<'high' | 'mid' | 'low', string> = {
   mid: 'bg-amber-500',
   low: 'bg-red-500',
 };
+
+// Text colour for the numeric score. The band still drives the colour -- it is
+// a useful at-a-glance cue -- but the number itself is now shown, because
+// "high/mid/low" collapses the whole 0..1 range into three buckets and a 0.86
+// then looks identical to a 1.00.
+const CONFIDENCE_TEXT: Record<'high' | 'mid' | 'low', string> = {
+  high: 'text-green-400',
+  mid: 'text-amber-400',
+  low: 'text-red-400',
+};
+
+/** exp(avg_logprob) as a percentage. Two significant figures: the underlying
+ * number is a mean per-token log-probability pushed through exp(), so it is
+ * precise but not accurate, and rendering it to more digits would imply a
+ * calibration it does not have. */
+const formatConfidence = (c: number) => `${(c * 100).toFixed(0)}%`;
 
 interface TranscriptPanelProps {
   transcription: TranscriptionResult | null;
@@ -58,7 +75,89 @@ export default function TranscriptPanel({
   const [copyFailed, setCopyFailed] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showFilterMenu, setShowFilterMenu] = useState(false);
+  const [showSpeakerMenu, setShowSpeakerMenu] = useState(false);
   const activeSegmentRef = useRef<HTMLDivElement>(null);
+
+  // Speaker overrides are per-transcription and persisted, because renaming
+  // five speakers is real work to redo after a reload. Keyed by transcription
+  // id so two files never share each other's names.
+  const storageKey = transcription ? `speakers:${transcription.id}` : null;
+  const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
+  const [speakerMerges, setSpeakerMerges] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!storageKey) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
+      setSpeakerNames(saved.names ?? {});
+      setSpeakerMerges(saved.merges ?? {});
+    } catch {
+      setSpeakerNames({});
+      setSpeakerMerges({});
+    }
+  }, [storageKey]);
+
+  useEffect(() => {
+    if (!storageKey) return;
+    try {
+      localStorage.setItem(storageKey,
+        JSON.stringify({ names: speakerNames, merges: speakerMerges }));
+    } catch {
+      // quota or private-mode: renames still work for this session
+    }
+  }, [storageKey, speakerNames, speakerMerges]);
+
+  // Follow the merge chain to the id a speaker ultimately belongs to. The
+  // visited set matters: merging A->B and later B->A is reachable through the
+  // UI and would otherwise spin forever.
+  const resolveSpeaker = useMemo(() => (id: string): string => {
+    const seen = new Set<string>();
+    let cur = id;
+    while (speakerMerges[cur] && !seen.has(cur)) {
+      seen.add(cur);
+      cur = speakerMerges[cur];
+    }
+    return cur;
+  }, [speakerMerges]);
+
+  const speakerLabel = (id: string) => {
+    const c = resolveSpeaker(id);
+    return speakerNames[c] || c;
+  };
+
+  const handleMerge = (from: string, into: string) => {
+    // resolve the target first, so merging into an already-merged speaker
+    // points at the surviving id rather than building a longer chain
+    const target = resolveSpeaker(into);
+    if (target === from) return;  // would create a cycle
+    setSpeakerMerges(m => ({ ...m, [from]: target }));
+  };
+
+  const handleUnmerge = (id: string) =>
+    setSpeakerMerges(m => { const n = { ...m }; delete n[id]; return n; });
+
+  const handleRename = (id: string, name: string) =>
+    setSpeakerNames(n => {
+      const next = { ...n };
+      if (name) next[id] = name;
+      else delete next[id];
+      return next;
+    });
+
+  // segment counts per canonical speaker, so the manager can show evidence
+  const speakerCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const seg of transcription?.segments ?? []) {
+      const c = resolveSpeaker(seg.speaker);
+      counts[c] = (counts[c] ?? 0) + 1;
+    }
+    return counts;
+  }, [transcription, resolveSpeaker]);
+
+  // speakers still visible after merges, in their original order
+  const visibleSpeakers = useMemo(
+    () => (transcription?.speakers ?? []).filter(s => resolveSpeaker(s) === s),
+    [transcription, resolveSpeaker]);
 
   const formatTime = (t: number) => {
     const h = Math.floor(t / 3600);
@@ -86,7 +185,9 @@ export default function TranscriptPanel({
   }, [activeSegmentIndex]);
 
   const filteredSegments = transcription?.segments.filter(seg => {
-    const matchesSpeaker = filterSpeaker === 'all' || seg.speaker === filterSpeaker;
+    // compare against the resolved id: filtering by a speaker that has absorbed
+    // others must show their segments too, not just the ones already labelled
+    const matchesSpeaker = filterSpeaker === 'all' || resolveSpeaker(seg.speaker) === filterSpeaker;
     const matchesSearch = !searchQuery || seg.text.toLowerCase().includes(searchQuery.toLowerCase());
     return matchesSpeaker && matchesSearch;
   }) ?? [];
@@ -117,12 +218,15 @@ export default function TranscriptPanel({
   // "text" view space-joins every VAD-derived ~24s chunk in a row regardless
   // of speaker, which reads as a single undifferentiated wall of text with no
   // paragraph or speaker structure at all.
+  // Grouping runs on the RESOLVED speaker, so two ids merged by hand read as
+  // one continuous paragraph rather than alternating rows from the same person.
   const paragraphs = (() => {
     const groups: { speaker: string; text: string }[] = [];
     for (const seg of filteredSegments) {
+      const spk = resolveSpeaker(seg.speaker);
       const last = groups[groups.length - 1];
-      if (last && last.speaker === seg.speaker) last.text += ' ' + seg.text;
-      else groups.push({ speaker: seg.speaker, text: seg.text });
+      if (last && last.speaker === spk) last.text += ' ' + seg.text;
+      else groups.push({ speaker: spk, text: seg.text });
     }
     return groups;
   })();
@@ -133,26 +237,46 @@ export default function TranscriptPanel({
     let filename = `transcript_${Date.now()}`;
     let mime = 'text/plain';
 
+    // Every export carries the renames and merges. Exporting raw S1/S2 ids
+    // would silently discard the work of naming them, which is the main reason
+    // anyone renames speakers in the first place.
     switch (format) {
       case 'txt':
-        content = transcription.rawText;
+        // rebuilt rather than reusing rawText, which the backend wrote with the
+        // original ids and knows nothing about later edits
+        content = transcription.segments
+          .map(s => `[${speakerLabel(s.speaker)}]: ${s.text}`)
+          .join('\n\n');
         filename += '.txt';
         break;
       case 'srt':
         content = transcription.segments.map((seg, i) => (
-          `${i + 1}\n${formatSRT(seg.start)} --> ${formatSRT(seg.end)}\n[${seg.speaker}]: ${seg.text}\n`
+          `${i + 1}\n${formatSRT(seg.start)} --> ${formatSRT(seg.end)}\n[${speakerLabel(seg.speaker)}]: ${seg.text}\n`
         )).join('\n');
         filename += '.srt';
         break;
       case 'json':
-        content = JSON.stringify({ transcription }, null, 2);
+        content = JSON.stringify({
+          transcription: {
+            ...transcription,
+            speakers: visibleSpeakers.map(speakerLabel),
+            segments: transcription.segments.map(s => ({
+              ...s,
+              speaker: speakerLabel(s.speaker),
+              // keep the machine's own answer alongside the human's, so the
+              // export stays a faithful record of what diarization produced
+              speakerId: s.speaker,
+              words: s.words.map(w => ({ ...w, speaker: speakerLabel(w.speaker) })),
+            })),
+          },
+        }, null, 2);
         filename += '.json';
         mime = 'application/json';
         break;
       case 'csv':
-        content = 'Speaker,Start,End,Text\n' +
+        content = 'Speaker,SpeakerId,Start,End,Text\n' +
           transcription.segments.map(s =>
-            `"${s.speaker}","${formatTime(s.start)}","${formatTime(s.end)}","${s.text.replace(/"/g, '""')}"`
+            `"${speakerLabel(s.speaker).replace(/"/g, '""')}","${s.speaker}","${formatTime(s.start)}","${formatTime(s.end)}","${s.text.replace(/"/g, '""')}"`
           ).join('\n');
         filename += '.csv';
         mime = 'text/csv';
@@ -173,7 +297,9 @@ export default function TranscriptPanel({
   const stats = transcription ? {
     words: transcription.segments.reduce((acc, s) => acc + s.words.length, 0),
     segments: transcription.segments.length,
-    speakers: transcription.speakers.length,
+    // count speakers AFTER merges: the header saying "5 speakers" while the
+    // transcript shows three is the first thing a user would notice as wrong
+    speakers: visibleSpeakers.length,
     duration: transcription.duration,
   } : null;
 
@@ -210,7 +336,7 @@ export default function TranscriptPanel({
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#0f0f0f]" onClick={() => { setShowExportMenu(false); setShowFilterMenu(false); }}>
+    <div className="flex flex-col h-full bg-[#0f0f0f]" onClick={() => { setShowExportMenu(false); setShowFilterMenu(false); setShowSpeakerMenu(false); }}>
       {/* Header */}
       <div className="panel-header px-4 py-3 flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg bg-violet-500/20 flex items-center justify-center">
@@ -315,10 +441,41 @@ export default function TranscriptPanel({
           ))}
         </div>
 
+        {/* Speaker rename / merge */}
+        <div className="relative">
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowSpeakerMenu(!showSpeakerMenu); setShowFilterMenu(false); }}
+            title="Rename or merge speakers"
+            aria-label="Rename or merge speakers"
+            className={`w-7 h-7 flex items-center justify-center rounded-lg border transition-colors ${
+              showSpeakerMenu || Object.keys(speakerNames).length > 0 || Object.keys(speakerMerges).length > 0
+                ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
+                : 'border-[#2a2a2a] text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+            }`}
+          >
+            <Users size={12} />
+          </button>
+          {showSpeakerMenu && (
+            <div onClick={e => e.stopPropagation()}>
+              <SpeakerManager
+                allSpeakers={transcription.speakers}
+                names={speakerNames}
+                counts={speakerCounts}
+                getColor={getSpeakerColor}
+                resolve={resolveSpeaker}
+                onRename={handleRename}
+                onMerge={handleMerge}
+                onUnmerge={handleUnmerge}
+                onClose={() => setShowSpeakerMenu(false)}
+              />
+            </div>
+          )}
+        </div>
+
         {/* Filter */}
         <div className="relative">
           <button
-            onClick={(e) => { e.stopPropagation(); setShowFilterMenu(!showFilterMenu); }}
+            onClick={(e) => { e.stopPropagation(); setShowFilterMenu(!showFilterMenu); setShowSpeakerMenu(false); }}
             className={`w-7 h-7 flex items-center justify-center rounded-lg border transition-colors ${
               filterSpeaker !== 'all'
                 ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
@@ -335,14 +492,14 @@ export default function TranscriptPanel({
               >
                 All Speakers
               </button>
-              {transcription.speakers.map(sp => (
+              {visibleSpeakers.map(sp => (
                 <button
                   key={sp}
                   onClick={() => { setFilterSpeaker(sp); setShowFilterMenu(false); }}
-                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 ${filterSpeaker === sp ? 'text-indigo-300 bg-indigo-500/10' : 'text-gray-300 hover:bg-white/5'}`}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 ${filterSpeaker === sp ? 'text-indigo-300 bg-indigo-500/10' : 'text-[var(--text-secondary)] hover:bg-white/5'}`}
                 >
                   <span className={`w-2 h-2 rounded-full ${getSpeakerColor(sp).dot}`} />
-                  Speaker {sp}
+                  {speakerLabel(sp)}
                 </button>
               ))}
             </div>
@@ -355,7 +512,8 @@ export default function TranscriptPanel({
         {viewMode === 'speaker' && (
           <div className="space-y-4">
             {filteredSegments.map((seg, idx) => {
-              const colors = getSpeakerColor(seg.speaker);
+              const spk = resolveSpeaker(seg.speaker);
+              const colors = getSpeakerColor(spk);
               const isActive = activeSegmentIndex >= 0 && transcription.segments[activeSegmentIndex] === seg;
               const band = confidenceBand(seg.confidence);
               return (
@@ -370,16 +528,23 @@ export default function TranscriptPanel({
                   <div className="flex items-center gap-2 mb-2">
                     <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full ${colors.bg}`}>
                       <div className={`w-1.5 h-1.5 rounded-full ${colors.dot}`} />
-                      <span className={`text-[11px] font-semibold ${colors.text}`}>Speaker {seg.speaker}</span>
+                      <span className={`text-[11px] font-semibold ${colors.text}`} dir="auto">
+                        {speakerNames[spk] ? speakerNames[spk] : `Speaker ${spk}`}
+                      </span>
                     </div>
-                    <span className="text-[11px] text-gray-600">{formatTime(seg.start)} – {formatTime(seg.end)}</span>
-                    {band && (
-                      <div
-                        className={`w-1.5 h-1.5 rounded-full ${CONFIDENCE_DOT[band]}`}
-                        title={`ASR confidence: ${Math.round((seg.confidence ?? 0) * 100)}%${
-                          band === 'low' ? ' -- worth double-checking against the audio' : ''
-                        }`}
-                      />
+                    <span className="text-[11px] text-[var(--text-muted)]">{formatTime(seg.start)} – {formatTime(seg.end)}</span>
+                    {band && seg.confidence != null && (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={`ASR confidence ${formatConfidence(seg.confidence)} — exp(avg_logprob) over this segment's tokens. `
+                          + `Not a calibrated probability: read it as a relative signal for which segments the model was least sure about.`
+                          + (band === 'low' ? ' Worth checking against the audio.' : '')}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${CONFIDENCE_DOT[band]}`} />
+                        <span className={`text-[11px] font-mono tabular-nums ${CONFIDENCE_TEXT[band]}`}>
+                          {formatConfidence(seg.confidence)}
+                        </span>
+                      </span>
                     )}
                     {isActive && (
                       <div className="flex gap-0.5 items-end h-3 ml-auto">
@@ -405,8 +570,10 @@ export default function TranscriptPanel({
             {paragraphs.map((p, idx) => {
               const colors = getSpeakerColor(p.speaker);
               return (
-                <p key={idx} className="text-sm text-gray-200 leading-loose whitespace-pre-wrap text-right" dir="rtl">
-                  <span className={`text-[11px] font-semibold ${colors.text} ml-1.5`}>{p.speaker}:</span>
+                <p key={idx} className="text-sm text-[var(--text-primary)] leading-loose whitespace-pre-wrap text-right" dir="rtl">
+                  <span className={`text-[11px] font-semibold ${colors.text} ml-1.5`} dir="auto">
+                    {speakerLabel(p.speaker)}:
+                  </span>
                   {p.text}
                 </p>
               );
@@ -417,7 +584,8 @@ export default function TranscriptPanel({
         {viewMode === 'timestamps' && (
           <div className="space-y-1">
             {filteredSegments.map((seg, idx) => {
-              const colors = getSpeakerColor(seg.speaker);
+              const spk = resolveSpeaker(seg.speaker);
+              const colors = getSpeakerColor(spk);
               const isActive = activeSegmentIndex >= 0 && transcription.segments[activeSegmentIndex] === seg;
               return (
                 <div
@@ -429,8 +597,11 @@ export default function TranscriptPanel({
                   onClick={() => onSeek(seg.start)}
                 >
                   <span className="text-indigo-400 font-mono w-12 flex-shrink-0">{formatTime(seg.start)}</span>
-                  <span className={`font-semibold w-8 flex-shrink-0 ${colors.text}`}>{seg.speaker}</span>
-                  <span className="text-gray-300 leading-relaxed text-right flex-1" dir="rtl">{highlightText(seg.text)}</span>
+                  {/* named speakers need more room than "S1"; truncate rather
+                      than let a long name push the text column around */}
+                  <span className={`font-semibold w-20 flex-shrink-0 truncate ${colors.text}`}
+                        dir="auto" title={speakerLabel(spk)}>{speakerLabel(spk)}</span>
+                  <span className="text-[var(--text-secondary)] leading-relaxed text-right flex-1" dir="rtl">{highlightText(seg.text)}</span>
                 </div>
               );
             })}

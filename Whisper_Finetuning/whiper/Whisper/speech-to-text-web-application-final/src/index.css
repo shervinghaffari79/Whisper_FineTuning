@@ -1,18 +1,54 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Vazirmatn carries the Persian/Arabic glyphs Inter does not have a single one
+   of. Without it every Persian character in this app -- which is most of them --
+   was drawn by whatever the OS happened to pick for Arabic script: Tahoma on
+   Windows, Geeza Pro on macOS. That is why the transcript looked different on
+   every machine, and why line heights were inconsistent between Persian and
+   Latin runs. Inter stays first so Latin text, digits and the UI chrome keep
+   their existing metrics; Vazirmatn only takes over where Inter has no glyph. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@300;400;500;600;700&display=swap');
 
 @import "tailwindcss";
+
+:root {
+  --font-ui: 'Inter', 'Vazirmatn', system-ui, sans-serif;
+  --font-fa: 'Vazirmatn', 'Inter', system-ui, sans-serif;
+
+  /* Text ramp, measured against --bg-base. Most of the old palette was already
+     fine: #e5e5e5 body is 15.2:1 and gray-400 is 7.6:1. The one real failure
+     was Tailwind's gray-500 (#6b7280) at 3.96:1, under the 4.5:1 WCAG AA
+     threshold for body text -- and it is used for timestamps and metadata,
+     which is exactly where Persian's thinner strokes suffer most. */
+  --text-primary: #f2f2f2;   /* 17.1:1 */
+  --text-secondary: #b8b8b8; /*  9.7:1 -- replaces gray-400 (7.6:1) */
+  --text-muted: #8a8a8a;     /*  5.6:1 -- replaces gray-500 (3.96:1, failed AA) */
+
+  --bg-base: #0f0f0f;
+  --bg-raised: #1a1a1a;
+  --border-subtle: #2a2a2a;
+}
 
 * {
   box-sizing: border-box;
 }
 
 body {
-  font-family: 'Inter', sans-serif;
-  background: #0f0f0f;
-  color: #e5e5e5;
+  font-family: var(--font-ui);
+  background: var(--bg-base);
+  color: var(--text-primary);
   margin: 0;
   padding: 0;
   overflow: hidden;
+}
+
+/* Persian runs are marked with dir="rtl" (transcript segments, chat input)
+   or dir="auto" (mixed content). Target those directly so the font switch
+   follows the text direction already being declared, rather than requiring
+   every component to add a font class. */
+[dir='rtl'] {
+  font-family: var(--font-fa);
+  /* Vazirmatn sits slightly tighter than Inter at the same size; Persian
+     also stacks diacritics above the baseline, so it needs the extra room */
+  line-height: 1.85;
 }
 
 ::-webkit-scrollbar {
@@ -40,21 +76,10 @@ body {
   overflow: hidden !important;
 }
 
-.speaker-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-}
-
-.speaker-S1 { background: rgba(99,102,241,0.2); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3); }
-.speaker-S2 { background: rgba(16,185,129,0.2); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
-.speaker-S3 { background: rgba(245,158,11,0.2); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
-.speaker-S4 { background: rgba(239,68,68,0.2); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
-.speaker-S5 { background: rgba(236,72,153,0.2); color: #f9a8d4; border: 1px solid rgba(236,72,153,0.3); }
+/* The .speaker-badge / .speaker-S1..S5 rules that used to live here were dead:
+   no component referenced them, and they had drifted out of sync with the real
+   palette in TranscriptPanel's SPEAKER_COLORS, which is keyed off Tailwind
+   classes. One definition, in the component that renders the badge. */
 
 .typing-cursor::after {
   content: '▋';
