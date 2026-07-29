@@ -107,7 +107,22 @@ def decode_audio(path: str) -> np.ndarray:
     """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
     cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
            "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-"]
-    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        # No timeout here previously: a file whose header confuses ffmpeg's
+        # probing (seen with some WAV variants -- an unfinalized RIFF size, an
+        # unusual bit depth/chunk layout) can make it hang rather than exit
+        # non-zero. subprocess.run then blocks forever, the job never reaches
+        # state="error", and the only thing the user sees is the "Processing"
+        # spinner -- indistinguishable from a slow file except that it never
+        # finishes. 10 minutes is generous for decoding alone (no model
+        # inference happens here, this is just a format conversion).
+        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "ffmpeg did not finish decoding this file within 10 minutes. The file's "
+            "container is likely malformed (e.g. an incomplete/streamed recording) "
+            "rather than genuinely large -- decoding itself is fast relative to "
+            "transcription. Try re-exporting or re-recording the file.")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')[-300:]}")
     if len(proc.stdout) == 0:
@@ -413,8 +428,8 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                 # instead of defaulting to "[نامفهوم]" for lack of context.
                 context = "\n".join(recent_context[-4:])
                 text = correct_fn(text, spk, context)
-            seg = {"speaker": spk, "start": st, "end": en,
-                   "text": text, "words": _words_from(text, st, en, spk)}
+            seg = {"speaker": spk, "start": st, "end": en, "text": text,
+                   "words": _words_from(text, st, en, spk), "confidence": s.get("confidence")}
             segments.append(seg)
             if text:
                 recent_context.append(f"{spk}: {text}")

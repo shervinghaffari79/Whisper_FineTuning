@@ -115,12 +115,18 @@ def _system_prompt(transcript: str) -> str:
     if transcript:
         return (
             "You are a speech analytics AI assistant. You have access to the following "
-            "transcript from a recorded conversation.\n\nTRANSCRIPT:\n" + transcript +
+            "transcript from a recorded conversation. Each line is prefixed with the "
+            "speaker and the exact timestamp it was said, e.g. \"[S1 04:12]: ...\".\n\n"
+            "TRANSCRIPT:\n" + transcript +
             "\n\nGuidelines:\n"
             "- Always respond in Persian (Farsi) regardless of the question's language\n"
             "- Keep answers brief and to the point\n"
             "- Reference specific speakers (S1, S2, S3, …) when relevant\n"
-            "- Include timestamps only when directly useful"
+            "- When you state something the transcript says, cite EXACTLY where by copying "
+            "that line's timestamp in brackets, e.g. [04:12] -- copy the digits verbatim from "
+            "the transcript, do not estimate or reformat them. This lets the user jump to and "
+            "verify that moment, so include one whenever you reference a specific claim, "
+            "decision, or quote -- not for general summaries with no single source line"
         )
     return ("You are a helpful AI assistant specialized in speech transcription and audio "
             "analysis. Always respond in Persian (Farsi) briefly and to the point.")
@@ -134,12 +140,73 @@ def _build_messages(messages, transcript):
     return msgs
 
 
+def _context_window(model, tok) -> int:
+    """Best-guess max sequence length the loaded model actually supports.
+    transformers configs vary in which attribute carries this, and an unset
+    tokenizer.model_max_length is a ~1e30 sentinel rather than a real number --
+    both need guarding against, or the fallback below is silently never used."""
+    ctx = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if ctx and ctx < 1_000_000:
+        return ctx
+    mm = getattr(tok, "model_max_length", None)
+    if mm and mm < 1_000_000:
+        return mm
+    return 32768
+
+
+def _fit_to_context(tok, messages, transcript, max_new_tokens, max_ctx):
+    """Shrink transcript then drop the oldest chat turns until the rendered
+    prompt fits max_ctx - max_new_tokens. The full transcript is re-embedded
+    in the system prompt on EVERY turn (see _system_prompt), so total tokens
+    grow with both conversation length and transcript length -- on a long
+    recording, a handful of follow-up questions is enough to exceed the
+    model's context window. Whether that then errors or just produces
+    garbage depends on the model, but either way the fix is the same: keep
+    the rendered prompt under the ceiling before generating, rather than
+    discovering the overflow from a failed generate() call."""
+    def render(msgs):
+        return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+
+    budget = max_ctx - max_new_tokens - 64
+    msgs = _build_messages(messages, transcript)
+    try:
+        if len(render(msgs)) <= budget:
+            return msgs
+    except Exception:
+        return msgs  # template/tokenizer surprised us -- let generate() surface it directly
+
+    # 1) shrink the transcript first -- usually the largest single contributor,
+    # and cutting it is less disruptive than dropping conversation turns
+    t = transcript
+    while t:
+        t = t[: int(len(t) * 0.7)]
+        msgs = _build_messages(messages, t)
+        try:
+            if len(render(msgs)) <= budget or not t:
+                break
+        except Exception:
+            break
+
+    # 2) still too long (a long chat history even with no transcript): drop
+    # the oldest turns, always keeping at least the latest user message
+    trimmed = list(messages)
+    while len(trimmed) > 1:
+        msgs = _build_messages(trimmed, t)
+        try:
+            if len(render(msgs)) <= budget:
+                break
+        except Exception:
+            break
+        trimmed.pop(0)
+    return _build_messages(trimmed, t)
+
+
 def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
     """Yield generated Persian text token-by-token, on whichever backend is active."""
     model, tok, tmpl = _ensure()
-    msgs = _build_messages(messages, transcript)
 
     if _active == "mlx":
+        msgs = _build_messages(messages, transcript)
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
         prompt = tok.apply_chat_template(msgs, add_generation_prompt=True, chat_template=tmpl)
@@ -152,16 +219,39 @@ def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
     # transformers backend: generate in a background thread, stream via TextIteratorStreamer
     import torch
     from transformers import TextIteratorStreamer
+
+    msgs = _fit_to_context(tok, messages, transcript, max_tokens, _context_window(model, tok))
     inputs = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
     streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
     gen_kwargs = dict(**inputs, max_new_tokens=max_tokens, streamer=streamer,
                       do_sample=temperature > 0, temperature=max(temperature, 0.01))
-    thread = threading.Thread(target=lambda: model.generate(**gen_kwargs), daemon=True)
+
+    # generate() runs in its own thread so the streamer can be consumed here as
+    # tokens arrive. Without the try/except, an exception in that thread (context
+    # overflow, a transient CUDA OOM while ASR/diarization also hold the GPU) is
+    # printed to stderr by Python's default thread excepthook and otherwise
+    # vanishes -- crucially, streamer.end() is never called, so `for text in
+    # streamer` below blocks forever waiting for a token that will never come.
+    # That is the hang this project's users hit as "stops responding after a
+    # few questions, have to start a new conversation": the request never
+    # completes, so there is nothing for the client to time out on either.
+    error: list = []
+
+    def _run():
+        try:
+            model.generate(**gen_kwargs)
+        except Exception as e:
+            error.append(e)
+            streamer.end()
+
+    thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     for text in streamer:
         if text:
             yield text
     thread.join()
+    if error:
+        raise RuntimeError(f"generation failed: {error[0]}") from error[0]
 
 
 def make_title(transcript: str) -> str:

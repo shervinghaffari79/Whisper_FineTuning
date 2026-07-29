@@ -88,10 +88,25 @@ def active_backend() -> str:
     return _active
 
 
+def _confidence(avg_logprob) -> "float | None":
+    """avg_logprob (mean per-token log-probability, both backends already
+    compute this for temperature-fallback / compression-ratio checks -- it was
+    just never read past that) -> a 0..1 pseudo-confidence via exp(). Not a
+    calibrated probability, but a real signal derived from the model's own
+    output rather than a fabricated number."""
+    if avg_logprob is None:
+        return None
+    try:
+        import math
+        return round(math.exp(avg_logprob), 4)
+    except (OverflowError, ValueError):
+        return None
+
+
 def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
     """Transcribe one audio chunk (float32 numpy array, `sample_rate` Hz).
-    Returns [{"start": float, "end": float, "text": str}, ...], timestamps
-    relative to the start of this chunk."""
+    Returns [{"start": float, "end": float, "text": str, "confidence": float|None}, ...],
+    timestamps relative to the start of this chunk."""
     _select()
     if _active == "mlx":
         import mlx_whisper
@@ -100,7 +115,9 @@ def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0), compression_ratio_threshold=2.4,
             no_speech_threshold=0.45, condition_on_previous_text=False,
             word_timestamps=False, verbose=None)
-        return [{"start": s["start"], "end": s["end"], "text": s["text"]} for s in r.get("segments", [])]
+        return [{"start": s["start"], "end": s["end"], "text": s["text"],
+                 "confidence": _confidence(s.get("avg_logprob"))}
+                for s in r.get("segments", [])]
 
     # ctranslate2 / faster-whisper -- pipeline.py already VAD-chunked the
     # audio, so vad_filter is off here to avoid re-segmenting a chunk that's
@@ -110,4 +127,6 @@ def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
         temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], compression_ratio_threshold=2.4,
         no_speech_threshold=0.45, condition_on_previous_text=False,
         vad_filter=False, word_timestamps=False)
-    return [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+    return [{"start": s.start, "end": s.end, "text": s.text,
+             "confidence": _confidence(getattr(s, "avg_logprob", None))}
+            for s in segments]
