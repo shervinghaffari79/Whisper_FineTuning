@@ -10,7 +10,10 @@ import { transcribeLocal } from '../services/localAsr';
 interface AudioPanelProps {
   onTranscriptionComplete: (result: TranscriptionResult) => void;
   onPartialTranscription?: (result: TranscriptionResult) => void;
-  currentTime: number;
+  /** An explicit "jump to this time" command from elsewhere in the app (a
+   * transcript segment, an AI citation). Carries a nonce so two requests for
+   * the same or a nearby time are still distinct events -- see App.tsx. */
+  seekRequest?: { time: number; nonce: number } | null;
   onTimeUpdate: (time: number) => void;
   onAudioLoaded: (duration: number) => void;
   transcription: TranscriptionResult | null;
@@ -23,7 +26,7 @@ type ProcessingStep = 'idle' | 'uploading' | 'processing' | 'fetching' | 'done' 
 export default function AudioPanel({
   onTranscriptionComplete,
   onPartialTranscription,
-  currentTime,
+  seekRequest,
   onTimeUpdate,
   onAudioLoaded,
   transcription,
@@ -124,14 +127,22 @@ export default function AudioPanel({
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [waveformData]);
 
-  // Sync only genuine external seeks (from TranscriptPanel clicking a segment)
-  // Ignore updates that originated from our own onTimeUpdate to break the feedback loop
+  // Apply an explicit seek command. No threshold and no comparison against the
+  // current position: this fires only when something deliberately asked to
+  // jump, so there is no feedback loop with our own onTimeUpdate to guard
+  // against. Keying the effect on the nonce (not the time) is what lets a
+  // repeat click on the same segment, or a jump to a moment 0.2s away, work.
   useEffect(() => {
-    if (audioRef.current && Math.abs(currentTime - localTimeRef.current) > 0.5) {
-      audioRef.current.currentTime = currentTime;
-      localTimeRef.current = currentTime;
+    if (!seekRequest || !audioRef.current) return;
+    const t = Math.max(0, Math.min(durationRef.current || Infinity, seekRequest.time));
+    audioRef.current.currentTime = t;
+    localTimeRef.current = t;
+    // move the readouts immediately rather than waiting for the next frame,
+    // so a seek while paused is visible at once
+    if (progressFillRef.current && durationRef.current > 0) {
+      progressFillRef.current.style.width = `${(t / durationRef.current) * 100}%`;
     }
-  }, [currentTime]);
+  }, [seekRequest?.nonce]);
 
   const handleFileSelect = async (file: File) => {
     setAudioFile(file);
@@ -259,7 +270,7 @@ export default function AudioPanel({
               ? 'border-indigo-500 bg-indigo-500/10'
               : audioFile
               ? 'border-green-500/40 bg-green-500/5'
-              : 'border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-white/[0.02]'
+              : 'border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-active)]'
           }`}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={() => setIsDragging(false)}

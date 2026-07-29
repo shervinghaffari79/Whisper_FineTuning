@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import AudioPanel from './components/AudioPanel';
 import TranscriptPanel from './components/TranscriptPanel';
 import ChatPanel from './components/ChatPanel';
@@ -32,7 +32,28 @@ export default function App() {
     setAudioDuration(duration);
   }, []);
 
+  // A seek is a COMMAND, and must not be conflated with currentTime, which is
+  // a continuously-updated REPORT of where playback is. AudioPanel used to
+  // detect seeks by watching currentTime and ignoring changes under 0.5s --
+  // needed to break the feedback loop against its own onTimeUpdate, but it
+  // also silently swallowed real seeks: clicking a transcript segment that
+  // starts within 0.5s of the playhead did nothing, and clicking the SAME
+  // segment twice did nothing the second time because the state value never
+  // changed. Word-level diarization made this far more visible by producing
+  // many short, closely-spaced segments.
+  //
+  // The nonce makes every request distinct, so repeated or nearby seeks all
+  // fire, and AudioPanel no longer has to guess which currentTime changes
+  // were externally commanded.
+  const [seekRequest, setSeekRequest] = useState<{ time: number; nonce: number } | null>(null);
+  const seekNonce = useRef(0);
+
   const handleSeek = useCallback((time: number) => {
+    seekNonce.current += 1;
+    setSeekRequest({ time, nonce: seekNonce.current });
+    // update immediately so the transcript's active-segment highlight and
+    // auto-scroll respond on click, rather than waiting for the audio
+    // element's next timeupdate event
     setCurrentTime(time);
   }, []);
 
@@ -133,7 +154,7 @@ export default function App() {
           <AudioPanel
             onTranscriptionComplete={handleTranscriptionComplete}
             onPartialTranscription={handlePartialTranscription}
-            currentTime={currentTime}
+            seekRequest={seekRequest}
             onTimeUpdate={handleTimeUpdate}
             onAudioLoaded={handleAudioLoaded}
             transcription={transcription}

@@ -235,12 +235,19 @@ export default function TranscriptPanel({
   // Grouping runs on the RESOLVED speaker, so two ids merged by hand read as
   // one continuous paragraph rather than alternating rows from the same person.
   const paragraphs = (() => {
-    const groups: { speaker: string; text: string }[] = [];
+    // start/end are carried so a paragraph is seekable and can be highlighted
+    // as active -- without them this view was the one place in the transcript
+    // you could not click to sync the audio.
+    const groups: { speaker: string; text: string; start: number; end: number }[] = [];
     for (const seg of filteredSegments) {
       const spk = resolveSpeaker(seg.speaker);
       const last = groups[groups.length - 1];
-      if (last && last.speaker === spk) last.text += ' ' + seg.text;
-      else groups.push({ speaker: spk, text: seg.text });
+      if (last && last.speaker === spk) {
+        last.text += ' ' + seg.text;
+        last.end = seg.end;
+      } else {
+        groups.push({ speaker: spk, text: seg.text, start: seg.start, end: seg.end });
+      }
     }
     return groups;
   })();
@@ -535,7 +542,7 @@ export default function TranscriptPanel({
                   key={idx}
                   ref={isActive ? activeSegmentRef : null}
                   className={`transcript-segment rounded-xl p-3 cursor-pointer transition-all ${
-                    isActive ? 'bg-indigo-500/10 border border-indigo-500/30' : 'hover:bg-white/[0.02] border border-transparent'
+                    isActive ? 'bg-[var(--accent-tint)] border border-[var(--accent-border)]' : 'hover:bg-[var(--bg-active)] border border-transparent'
                   }`}
                   onClick={() => onSeek(seg.start)}
                 >
@@ -583,8 +590,19 @@ export default function TranscriptPanel({
           <div className="prose max-w-none space-y-3">
             {paragraphs.map((p, idx) => {
               const colors = getSpeakerColor(p.speaker);
+              const isActive = currentTime >= p.start && currentTime <= p.end;
               return (
-                <p key={idx} className="text-sm text-[var(--text-primary)] leading-loose whitespace-pre-wrap text-right" dir="rtl">
+                <p
+                  key={idx}
+                  ref={isActive ? activeSegmentRef : null}
+                  onClick={() => onSeek(p.start)}
+                  title={`${formatTime(p.start)} – ${formatTime(p.end)}`}
+                  className={`text-sm text-[var(--text-primary)] leading-loose whitespace-pre-wrap
+                              text-right cursor-pointer rounded-lg px-2 py-1 transition-colors ${
+                                isActive ? 'bg-[var(--accent-tint)]' : 'hover:bg-[var(--bg-active)]'
+                              }`}
+                  dir="rtl"
+                >
                   <span className={`text-[11px] font-semibold ${colors.text} ml-1.5`} dir="auto">
                     {speakerLabel(p.speaker)}:
                   </span>
@@ -606,7 +624,7 @@ export default function TranscriptPanel({
                   key={idx}
                   ref={isActive ? activeSegmentRef : null}
                   className={`flex gap-3 text-xs py-1.5 px-2 rounded-lg cursor-pointer transition-colors ${
-                    isActive ? 'bg-indigo-500/10' : 'hover:bg-white/[0.02]'
+                    isActive ? 'bg-[var(--accent-tint)]' : 'hover:bg-[var(--bg-active)]'
                   }`}
                   onClick={() => onSeek(seg.start)}
                 >
