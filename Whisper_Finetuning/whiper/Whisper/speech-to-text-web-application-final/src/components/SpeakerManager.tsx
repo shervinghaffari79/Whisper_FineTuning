@@ -65,12 +65,12 @@ export default function SpeakerManager({
   };
 
   return (
-    <div className="absolute right-0 top-full mt-1 w-72 rounded-lg border border-[#2a2a2a] bg-[#161616] shadow-xl z-30 overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a]">
+    <div className="absolute right-0 top-full mt-1 w-72 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-inset)] shadow-xl z-30 overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-subtle)]">
         <span className="flex items-center gap-1.5 text-xs font-semibold text-[var(--text-primary)]">
           <Users size={13} /> Speakers
         </span>
-        <button onClick={onClose} className="p-0.5 rounded hover:bg-white/10 text-[var(--text-muted)]"
+        <button onClick={onClose} className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)]"
                 aria-label="Close speaker manager">
           <X size={13} />
         </button>
@@ -83,7 +83,7 @@ export default function SpeakerManager({
           const total = counts[id] ?? 0;
 
           return (
-            <div key={id} className="px-3 py-1.5 hover:bg-white/[0.03]">
+            <div key={id} className="px-3 py-1.5 hover:bg-[var(--bg-active)]">
               <div className="flex items-center gap-2">
                 <span className={`w-2 h-2 rounded-full shrink-0 ${c.dot}`} />
 
@@ -99,15 +99,15 @@ export default function SpeakerManager({
                       }}
                       placeholder={id}
                       dir="auto"
-                      className="flex-1 min-w-0 bg-[#0f0f0f] border border-[#333] rounded px-1.5 py-0.5
+                      className="flex-1 min-w-0 bg-[var(--bg-base)] border border-[var(--border-strong)] rounded px-1.5 py-0.5
                                  text-xs text-[var(--text-primary)] focus:border-indigo-500"
                     />
                     <button onClick={() => commitEdit(id)} aria-label="Save name"
-                            className="p-0.5 rounded hover:bg-white/10 text-emerald-400">
+                            className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-emerald-400">
                       <Check size={13} />
                     </button>
                     <button onClick={() => { setEditing(null); setDraft(''); }} aria-label="Cancel rename"
-                            className="p-0.5 rounded hover:bg-white/10 text-[var(--text-muted)]">
+                            className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)]">
                       <X size={13} />
                     </button>
                   </>
@@ -123,7 +123,7 @@ export default function SpeakerManager({
                       {total} seg{total === 1 ? '' : 's'}
                     </span>
                     <button onClick={() => startEdit(id)} aria-label={`Rename ${id}`}
-                            className="p-0.5 rounded hover:bg-white/10 text-[var(--text-muted)] shrink-0">
+                            className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] shrink-0">
                       <Pencil size={12} />
                     </button>
                   </>
@@ -138,8 +138,8 @@ export default function SpeakerManager({
                       onClick={() => onUnmerge(a)}
                       title={`Split ${a} back out of ${names[id] || id}`}
                       className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded
-                                 bg-white/5 text-[var(--text-muted)] hover:text-[var(--text-primary)]
-                                 hover:bg-white/10"
+                                 bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-primary)]
+                                 hover:bg-[var(--bg-hover)]"
                     >
                       {a} <X size={9} />
                     </button>
@@ -156,13 +156,13 @@ export default function SpeakerManager({
                       <button
                         key={o}
                         onClick={() => { onMerge(id, o); setMergeSource(null); }}
-                        className={`text-[10px] px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/15 ${getColor(o).text}`}
+                        className={`text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] ${getColor(o).text}`}
                       >
                         {names[o] || o}
                       </button>
                     ))}
                     <button onClick={() => setMergeSource(null)}
-                            className="text-[10px] px-1.5 py-0.5 rounded text-[var(--text-muted)] hover:bg-white/10">
+                            className="text-[10px] px-1.5 py-0.5 rounded text-[var(--text-muted)] hover:bg-[var(--bg-hover)]">
                       cancel
                     </button>
                   </div>
@@ -191,7 +191,7 @@ export default function SpeakerManager({
       </div>
 
       {mergedAway.length > 0 && (
-        <div className="px-3 py-1.5 border-t border-[#2a2a2a] text-[10px] text-[var(--text-muted)]">
+        <div className="px-3 py-1.5 border-t border-[var(--border-subtle)] text-[10px] text-[var(--text-muted)]">
           {mergedAway.length} id{mergedAway.length === 1 ? '' : 's'} merged — click one above to split it back out
         </div>
       )}

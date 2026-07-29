@@ -42,9 +42,9 @@ function renderInline(text: string, keyPrefix: string, onCite?: (seconds: number
     const tok = m[0];
     const key = `${keyPrefix}-${i++}`;
     if (tok.startsWith('**')) {
-      nodes.push(<strong key={key} className="font-semibold text-white">{tok.slice(2, -2)}</strong>);
+      nodes.push(<strong key={key} className="font-semibold text-[var(--text-primary)]">{tok.slice(2, -2)}</strong>);
     } else if (tok.startsWith('`')) {
-      nodes.push(<code key={key} className="px-1 py-0.5 rounded bg-black/40 text-[0.85em] font-mono text-indigo-200" dir="ltr">{tok.slice(1, -1)}</code>);
+      nodes.push(<code key={key} className="px-1 py-0.5 rounded bg-[var(--code-bg)] text-[0.85em] font-mono text-[var(--accent-text)]" dir="ltr">{tok.slice(1, -1)}</code>);
     } else if (TIMESTAMP.test(tok)) {
       const seconds = parseTimestamp(tok);
       nodes.push(
@@ -97,7 +97,7 @@ export default function Markdown({ content, onCite }: MarkdownProps) {
       while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++; }
       i++; // closing fence
       blocks.push(
-        <pre key={key++} dir="ltr" className="my-1.5 p-2.5 rounded-lg bg-black/50 overflow-x-auto text-[0.82em] font-mono text-gray-200 leading-relaxed">
+        <pre key={key++} dir="ltr" className="my-1.5 p-2.5 rounded-lg bg-[var(--code-bg)] overflow-x-auto text-[0.82em] font-mono text-[var(--text-primary)] leading-relaxed">
           <code>{buf.join('\n')}</code>
         </pre>,
       );
@@ -107,7 +107,7 @@ export default function Markdown({ content, onCite }: MarkdownProps) {
     // heading
     const h = HEADING.exec(line);
     if (h) {
-      blocks.push(<div key={key++} dir="auto" className="font-semibold text-white mt-2 mb-0.5">{renderInline(h[2], `h${key}`, onCite)}</div>);
+      blocks.push(<div key={key++} dir="auto" className="font-semibold text-[var(--text-primary)] mt-2 mb-0.5">{renderInline(h[2], `h${key}`, onCite)}</div>);
       i++;
       continue;
     }

@@ -20,9 +20,9 @@ function confidenceBand(c: number | null | undefined): 'high' | 'mid' | 'low' | 
 }
 
 const CONFIDENCE_DOT: Record<'high' | 'mid' | 'low', string> = {
-  high: 'bg-green-500',
-  mid: 'bg-amber-500',
-  low: 'bg-red-500',
+  high: 'bg-[var(--conf-high)]',
+  mid: 'bg-[var(--conf-mid)]',
+  low: 'bg-[var(--conf-low)]',
 };
 
 // Text colour for the numeric score. The band still drives the colour -- it is
@@ -30,9 +30,9 @@ const CONFIDENCE_DOT: Record<'high' | 'mid' | 'low', string> = {
 // "high/mid/low" collapses the whole 0..1 range into three buckets and a 0.86
 // then looks identical to a 1.00.
 const CONFIDENCE_TEXT: Record<'high' | 'mid' | 'low', string> = {
-  high: 'text-green-400',
-  mid: 'text-amber-400',
-  low: 'text-red-400',
+  high: 'text-[var(--conf-high)]',
+  mid: 'text-[var(--conf-mid)]',
+  low: 'text-[var(--conf-low)]',
 };
 
 /** exp(avg_logprob) as a percentage. Two significant figures: the underlying
@@ -48,16 +48,30 @@ interface TranscriptPanelProps {
   onSendToChat: (text: string) => void;
 }
 
-const SPEAKER_COLORS: Record<string, { bg: string; text: string; dot: string }> = {
-  S1: { bg: 'bg-indigo-500/10', text: 'text-indigo-300', dot: 'bg-indigo-500' },
-  S2: { bg: 'bg-emerald-500/10', text: 'text-emerald-300', dot: 'bg-emerald-500' },
-  S3: { bg: 'bg-amber-500/10', text: 'text-amber-300', dot: 'bg-amber-500' },
-  S4: { bg: 'bg-rose-500/10', text: 'text-rose-300', dot: 'bg-rose-500' },
-  S5: { bg: 'bg-pink-500/10', text: 'text-pink-300', dot: 'bg-pink-500' },
-};
+// Resolved through CSS variables rather than fixed Tailwind shades, because a
+// palette tuned for a near-black page washes out to ~2:1 on a white one. Each
+// theme defines its own shade of the same hue in index.css, so a speaker keeps
+// a stable identity across themes while staying readable in both.
+// Written out in full rather than composed from a template literal: Tailwind's
+// JIT scans source text for COMPLETE class strings, so `bg-[var(--spk-${n}-bg)]`
+// would never be generated and the colours would silently not apply.
+const SPEAKER_COLORS = [
+  { bg: 'bg-[var(--spk-1-bg)]', text: 'text-[var(--spk-1-text)]', dot: 'bg-[var(--spk-1-dot)]' },
+  { bg: 'bg-[var(--spk-2-bg)]', text: 'text-[var(--spk-2-text)]', dot: 'bg-[var(--spk-2-dot)]' },
+  { bg: 'bg-[var(--spk-3-bg)]', text: 'text-[var(--spk-3-text)]', dot: 'bg-[var(--spk-3-dot)]' },
+  { bg: 'bg-[var(--spk-4-bg)]', text: 'text-[var(--spk-4-text)]', dot: 'bg-[var(--spk-4-dot)]' },
+  { bg: 'bg-[var(--spk-5-bg)]', text: 'text-[var(--spk-5-text)]', dot: 'bg-[var(--spk-5-dot)]' },
+] as const;
 
-const getSpeakerColor = (speaker: string) =>
-  SPEAKER_COLORS[speaker] || { bg: 'bg-purple-500/10', text: 'text-purple-300', dot: 'bg-purple-500' };
+const SPEAKER_OVERFLOW =
+  { bg: 'bg-[var(--spk-x-bg)]', text: 'text-[var(--spk-x-text)]', dot: 'bg-[var(--spk-x-dot)]' } as const;
+
+const getSpeakerColor = (speaker: string) => {
+  const n = Number(speaker.replace(/^S/, ''));
+  return Number.isFinite(n) && n >= 1 && n <= SPEAKER_COLORS.length
+    ? SPEAKER_COLORS[n - 1]
+    : SPEAKER_OVERFLOW;  // speakers past the palette share one colour, as before
+};
 
 type ViewMode = 'speaker' | 'text' | 'timestamps';
 type ExportFormat = 'txt' | 'srt' | 'json' | 'csv';
@@ -305,26 +319,26 @@ export default function TranscriptPanel({
 
   if (!transcription) {
     return (
-      <div className="flex flex-col h-full bg-[#0f0f0f]">
+      <div className="flex flex-col h-full bg-[var(--bg-base)]">
         <div className="panel-header px-4 py-3 flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg bg-violet-500/20 flex items-center justify-center">
             <FileText size={14} className="text-violet-400" />
           </div>
-          <span className="text-sm font-semibold text-white">Transcript</span>
+          <span className="text-sm font-semibold text-[var(--text-primary)]">Transcript</span>
         </div>
         <div className="flex-1 flex flex-col items-center justify-center text-center p-8 gap-4">
-          <div className="w-16 h-16 rounded-2xl bg-[#161616] border border-[#222] flex items-center justify-center">
-            <FileText size={28} className="text-gray-600" />
+          <div className="w-16 h-16 rounded-2xl bg-[var(--bg-inset)] border border-[var(--border-shell)] flex items-center justify-center">
+            <FileText size={28} className="text-[var(--text-muted)]" />
           </div>
           <div>
-            <h3 className="text-base font-semibold text-white mb-1">No Transcript Yet</h3>
-            <p className="text-sm text-gray-500 max-w-[220px]">
+            <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">No Transcript Yet</h3>
+            <p className="text-sm text-[var(--text-muted)] max-w-[220px]">
               Upload an audio file in the left panel and click Transcribe to get started.
             </p>
           </div>
           <div className="space-y-2 text-left w-full max-w-[220px]">
             {['Speaker diarization', 'Timestamped segments', 'Multi-language support', 'Export to SRT, TXT, JSON'].map(f => (
-              <div key={f} className="flex items-center gap-2 text-xs text-gray-400">
+              <div key={f} className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
                 <div className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
                 {f}
               </div>
@@ -336,18 +350,18 @@ export default function TranscriptPanel({
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#0f0f0f]" onClick={() => { setShowExportMenu(false); setShowFilterMenu(false); setShowSpeakerMenu(false); }}>
+    <div className="flex flex-col h-full bg-[var(--bg-base)]" onClick={() => { setShowExportMenu(false); setShowFilterMenu(false); setShowSpeakerMenu(false); }}>
       {/* Header */}
       <div className="panel-header px-4 py-3 flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg bg-violet-500/20 flex items-center justify-center">
           <FileText size={14} className="text-violet-400" />
         </div>
-        <span className="text-sm font-semibold text-white flex-1">Transcript</span>
+        <span className="text-sm font-semibold text-[var(--text-primary)] flex-1">Transcript</span>
         <div className="flex items-center gap-1">
           {/* Copy */}
           <button
             onClick={handleCopy}
-            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-colors"
+            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-[var(--bg-active)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
             title={copyFailed ? 'Copy failed -- clipboard unavailable' : 'Copy transcript'}
           >
             {copied
@@ -360,18 +374,18 @@ export default function TranscriptPanel({
           <div className="relative">
             <button
               onClick={(e) => { e.stopPropagation(); setShowExportMenu(!showExportMenu); }}
-              className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-colors"
+              className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-[var(--bg-active)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
               title="Export"
             >
               <Download size={14} />
             </button>
             {showExportMenu && (
-              <div className="absolute right-0 top-full mt-1 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg overflow-hidden z-20 shadow-xl w-28" onClick={e => e.stopPropagation()}>
+              <div className="absolute right-0 top-full mt-1 bg-[var(--bg-raised)] border border-[var(--border-subtle)] rounded-lg overflow-hidden z-20 shadow-xl w-28" onClick={e => e.stopPropagation()}>
                 {(['txt', 'srt', 'json', 'csv'] as ExportFormat[]).map(fmt => (
                   <button
                     key={fmt}
                     onClick={() => handleExport(fmt)}
-                    className="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-white/5 uppercase font-mono"
+                    className="w-full text-left px-3 py-2 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-active)] uppercase font-mono"
                   >
                     .{fmt}
                   </button>
@@ -382,7 +396,7 @@ export default function TranscriptPanel({
           {/* Send to chat */}
           <button
             onClick={() => onSendToChat(transcription.rawText)}
-            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-colors"
+            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-[var(--bg-active)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
             title="Analyze in chat"
           >
             <MessageSquare size={14} />
@@ -392,16 +406,16 @@ export default function TranscriptPanel({
 
       {/* Stats Bar */}
       {stats && (
-        <div className="px-4 py-2.5 bg-[#111] border-b border-[#1e1e1e] flex items-center gap-4">
-          <div className="flex items-center gap-1.5 text-xs text-gray-400">
+        <div className="px-4 py-2.5 bg-[var(--bg-base)] border-b border-[var(--border-shell)] flex items-center gap-4">
+          <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
             <Users size={11} />
             <span>{stats.speakers} speakers</span>
           </div>
-          <div className="flex items-center gap-1.5 text-xs text-gray-400">
+          <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
             <AlignLeft size={11} />
             <span>{stats.words.toLocaleString()} words</span>
           </div>
-          <div className="flex items-center gap-1.5 text-xs text-gray-400">
+          <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
             <Clock size={11} />
             <span>{formatTime(stats.duration)}</span>
           </div>
@@ -409,20 +423,20 @@ export default function TranscriptPanel({
       )}
 
       {/* Toolbar */}
-      <div className="px-4 py-2 border-b border-[#1e1e1e] flex items-center gap-2">
+      <div className="px-4 py-2 border-b border-[var(--border-shell)] flex items-center gap-2">
         {/* Search */}
         <div className="flex-1 relative">
-          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
           <input
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
             placeholder="Search transcript..."
-            className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder-gray-600 focus:border-indigo-500/50 transition-colors"
+            className="w-full bg-[var(--bg-raised)] border border-[var(--border-subtle)] rounded-lg pl-7 pr-3 py-1.5 text-xs text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:border-indigo-500/50 transition-colors"
           />
         </div>
 
         {/* View mode */}
-        <div className="flex bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg overflow-hidden">
+        <div className="flex bg-[var(--bg-raised)] border border-[var(--border-subtle)] rounded-lg overflow-hidden">
           {[
             { mode: 'speaker' as ViewMode, icon: Users, title: 'Speaker view' },
             { mode: 'text' as ViewMode, icon: AlignLeft, title: 'Text view' },
@@ -433,7 +447,7 @@ export default function TranscriptPanel({
               onClick={() => setViewMode(mode)}
               title={title}
               className={`w-7 h-7 flex items-center justify-center transition-colors ${
-                viewMode === mode ? 'bg-indigo-500 text-white' : 'text-gray-500 hover:text-gray-300'
+                viewMode === mode ? 'bg-indigo-500 text-white' : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
               }`}
             >
               <Icon size={12} />
@@ -450,7 +464,7 @@ export default function TranscriptPanel({
             className={`w-7 h-7 flex items-center justify-center rounded-lg border transition-colors ${
               showSpeakerMenu || Object.keys(speakerNames).length > 0 || Object.keys(speakerMerges).length > 0
                 ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
-                : 'border-[#2a2a2a] text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+                : 'border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
             }`}
           >
             <Users size={12} />
@@ -479,16 +493,16 @@ export default function TranscriptPanel({
             className={`w-7 h-7 flex items-center justify-center rounded-lg border transition-colors ${
               filterSpeaker !== 'all'
                 ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300'
-                : 'border-[#2a2a2a] text-gray-500 hover:text-gray-300'
+                : 'border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
             }`}
           >
             <Filter size={12} />
           </button>
           {showFilterMenu && (
-            <div className="absolute right-0 top-full mt-1 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg overflow-hidden z-20 shadow-xl min-w-[120px]" onClick={e => e.stopPropagation()}>
+            <div className="absolute right-0 top-full mt-1 bg-[var(--bg-raised)] border border-[var(--border-subtle)] rounded-lg overflow-hidden z-20 shadow-xl min-w-[120px]" onClick={e => e.stopPropagation()}>
               <button
                 onClick={() => { setFilterSpeaker('all'); setShowFilterMenu(false); }}
-                className={`w-full text-left px-3 py-2 text-xs ${filterSpeaker === 'all' ? 'text-indigo-300 bg-indigo-500/10' : 'text-gray-300 hover:bg-white/5'}`}
+                className={`w-full text-left px-3 py-2 text-xs ${filterSpeaker === 'all' ? 'text-indigo-300 bg-indigo-500/10' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-active)]'}`}
               >
                 All Speakers
               </button>
@@ -496,7 +510,7 @@ export default function TranscriptPanel({
                 <button
                   key={sp}
                   onClick={() => { setFilterSpeaker(sp); setShowFilterMenu(false); }}
-                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 ${filterSpeaker === sp ? 'text-indigo-300 bg-indigo-500/10' : 'text-[var(--text-secondary)] hover:bg-white/5'}`}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 ${filterSpeaker === sp ? 'text-indigo-300 bg-indigo-500/10' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-active)]'}`}
                 >
                   <span className={`w-2 h-2 rounded-full ${getSpeakerColor(sp).dot}`} />
                   {speakerLabel(sp)}
@@ -558,7 +572,7 @@ export default function TranscriptPanel({
                       </div>
                     )}
                   </div>
-                  <p className="text-sm text-gray-200 leading-relaxed text-right" dir="rtl">{highlightText(seg.text)}</p>
+                  <p className="text-sm text-[var(--text-primary)] leading-relaxed text-right" dir="rtl">{highlightText(seg.text)}</p>
                 </div>
               );
             })}
@@ -610,15 +624,15 @@ export default function TranscriptPanel({
 
         {filteredSegments.length === 0 && (
           <div className="flex flex-col items-center justify-center py-12 text-center">
-            <Search size={24} className="text-gray-600 mb-2" />
-            <p className="text-sm text-gray-500">No results found</p>
+            <Search size={24} className="text-[var(--text-muted)] mb-2" />
+            <p className="text-sm text-[var(--text-muted)]">No results found</p>
           </div>
         )}
       </div>
 
       {/* Quick Analysis Buttons */}
-      <div className="p-4 border-t border-[#1e1e1e]">
-        <p className="text-xs text-gray-500 mb-2">Quick Analysis</p>
+      <div className="p-4 border-t border-[var(--border-shell)]">
+        <p className="text-xs text-[var(--text-muted)] mb-2">Quick Analysis</p>
         <div className="flex flex-wrap gap-1.5">
           {[
             'Summarize this transcript',
@@ -629,7 +643,7 @@ export default function TranscriptPanel({
             <button
               key={prompt}
               onClick={() => onSendToChat(prompt)}
-              className="text-xs px-2.5 py-1 bg-[#1a1a1a] hover:bg-[#222] border border-[#2a2a2a] hover:border-indigo-500/40 text-gray-400 hover:text-white rounded-lg transition-all"
+              className="text-xs px-2.5 py-1 bg-[var(--bg-raised)] hover:bg-[var(--border-shell)] border border-[var(--border-subtle)] hover:border-indigo-500/40 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded-lg transition-all"
             >
               {prompt}
             </button>
