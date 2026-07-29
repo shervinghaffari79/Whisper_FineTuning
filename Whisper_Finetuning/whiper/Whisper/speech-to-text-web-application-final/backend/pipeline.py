@@ -38,6 +38,21 @@ import numpy as np
 SAMPLE_RATE = 16000
 DIARIZER = os.environ.get("DIARIZER", "pyannote")  # "pyannote" | "resemblyzer" | "off"
 
+# Word-level speaker assignment needs word timestamps, which cost a second
+# alignment pass inside Whisper (cross-attention + DTW, per segment, on top of
+# beam search). That is a real and USER-VISIBLE slowdown, not a rounding error.
+# DIARIZE_WORD_LEVEL=0 turns it off and falls back to labelling each whole ASR
+# segment with its overlap-winner -- much faster, but a segment spanning a
+# speaker change then gets one label for both people.
+WORD_LEVEL_DIARIZATION = os.environ.get("DIARIZE_WORD_LEVEL", "1") != "0"
+
+# A short run of words bracketed by the SAME speaker on both sides is usually
+# diarization jitter rather than a real turn -- but not always: in a meeting a
+# 1-3 word interjection ("بله", "درسته") from a second person is a genuine
+# turn, and eating it would be wrong. So this is opt-in, 0 = disabled, and the
+# absorption below only fires on the same-speaker-both-sides pattern.
+SANDWICH_WORDS = int(os.environ.get("DIARIZE_SANDWICH_WORDS", "0"))
+
 
 def model_dir() -> Path:
     """Best-guess directory of the ASR model that will be used -- mirrors
@@ -483,13 +498,42 @@ def _split_on_speaker(words, turns, min_words=2, carry_label=None, carry_count=0
             changed = True
             break
 
-    # The case the loop above cannot reach: the WHOLE word list agrees on one
+    # Sandwich absorption (opt-in, DIARIZE_SANDWICH_WORDS): a run bracketed by
+    # the SAME speaker on both sides, and short, is usually a wobble in the
+    # embedding rather than a real turn -- someone's pitch or loudness shifted
+    # mid-sentence. This uses a LARGER word budget than min_words above,
+    # because the both-sides-agree pattern is much stronger evidence of jitter
+    # than shortness alone. Off by default: a brief interjection from a real
+    # second person in a meeting has exactly this shape and must survive.
+    if SANDWICH_WORDS > 0:
+        changed = True
+        while changed and len(runs) >= 3:
+            changed = False
+            for idx in range(1, len(runs) - 1):
+                spk, members = runs[idx]
+                prev_spk = runs[idx - 1][0]
+                if (prev_spk == runs[idx + 1][0] and prev_spk != spk
+                        and len(members) <= SANDWICH_WORDS):
+                    for i in members:
+                        labels[i] = prev_spk
+                    runs = group(labels)
+                    changed = True
+                    break
+
+    # The case the loops above cannot reach: the WHOLE word list agrees on one
     # speaker (len(runs) == 1), so there is no internal disagreement to
     # trigger absorption, no matter how short it is. This is exactly a short
     # standalone Whisper segment -- absorb it into the carried-in speaker if
-    # that speaker had solid evidence and this one does not.
+    # that speaker had solid evidence and this one does not. The word budget
+    # is the sandwich one when enabled, since a standalone short segment
+    # between two same-speaker neighbours is the same phenomenon seen across
+    # a segment boundary instead of inside one.
+    # Budget stays strictly "< min_words" when the sandwich rule is off, so
+    # disabling it really is a no-op rather than a quieter behaviour change.
+    standalone_ok = (len(runs[0][1]) <= SANDWICH_WORDS if SANDWICH_WORDS > 0
+                     else len(runs[0][1]) < min_words)
     if (len(runs) == 1 and carry_label is not None and runs[0][0] != carry_label
-            and len(runs[0][1]) < min_words and carry_count >= min_words):
+            and standalone_ok and carry_count >= min_words):
         runs = [[carry_label, runs[0][1]]]
 
     return [[spk, [words[i] for i in members]] for spk, members in runs]
@@ -565,7 +609,8 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         # Word timestamps cost an extra alignment pass, so only pay for them
         # when diarization can actually use them to split a segment.
         chunk_segments = asr_engine.transcribe_chunk(
-            audio[a:b], SAMPLE_RATE, word_timestamps=bool(turns))
+            audio[a:b], SAMPLE_RATE,
+            word_timestamps=bool(turns) and WORD_LEVEL_DIARIZATION)
         off = a / SAMPLE_RATE
 
         def _emit(spk_raw, st, en, raw, words, confidence):
