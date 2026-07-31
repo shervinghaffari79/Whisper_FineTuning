@@ -11,13 +11,6 @@ Whisper_Finetuning/finetune_persian/__pycache__/
 Whisper_Finetuning/models/
 # node_modules anywhere in the repo (web app dependencies -- regenerable via npm install)
 **/node_modules/
-# bulk data -- downloaded audio, decoded wav16k, cut clips, the built dataset.
-# The manifests and transcripts are the reproducible inputs, so keep those.
-Whisper_Finetuning/finetune_persian/sm_data/*
-!Whisper_Finetuning/finetune_persian/sm_data/links.jsonl
-!Whisper_Finetuning/finetune_persian/sm_data/urls.txt
-!Whisper_Finetuning/finetune_persian/sm_data/transcripts/
-# the validation audio itself -- bulk data like the rest of sm_data. The
-# transcripts beside it are the reproducible input and stay tracked, but the
-# !transcripts/ rule above would otherwise sweep this 143MB of mp3 in with them.
-Whisper_Finetuning/finetune_persian/sm_data/transcripts/val_audio/
+# hf_build_dataset.py's local output, if built outside Modal -- audio/dataset
+# bulk data, not reproducible-input source (the pushed Hub dataset is)
+Whisper_Finetuning/finetune_persian/sm_data/
