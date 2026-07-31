@@ -35,7 +35,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import transformers
-from datasets import Audio, load_dataset, load_from_disk
+from datasets import Audio, Features, Value, concatenate_datasets, load_dataset, load_from_disk
 from transformers import (
     EarlyStoppingCallback,
     Seq2SeqTrainer,
@@ -69,6 +69,46 @@ def load_dataset_dict(spec: str):
     for split in ds:
         ds[split] = ds[split].cast_column("audio", Audio(decode=False))
     return ds, True
+
+
+def resolve_train_to_paths(ds_train, is_hub: bool, clips_dir, cache_dir):
+    """Normalize a train split's "audio" column to absolute file path strings,
+    so heterogeneous sources (local-disk filenames, Hub-embedded bytes) can be
+    concatenated into one Dataset and read by the ordinary local-disk code
+    path in make_prepare/make_batch_prepare below with no changes -- pathlib
+    joins an absolute right-hand side by replacing the left
+    (Path("x") / "/abs/y" == Path("/abs/y")), so passing these rows through
+    clips_dir / batch["audio"] resolves to the absolute path unchanged
+    regardless of what clips_dir is.
+
+    Hub rows get their embedded bytes written to cache_dir ONCE (skipped on
+    repeat runs if the file already exists there -- put cache_dir on a
+    persistent volume to avoid re-decoding every run).
+    """
+    # map() otherwise keeps the ORIGINAL declared Arrow feature type for a
+    # column even when the function returns a different kind of value for it
+    # -- a Hub source's "audio" (Audio(decode=False), i.e. a {bytes, path}
+    # struct) stays typed that way even after being overwritten with plain
+    # path strings, which fails concatenate_datasets against a local-disk
+    # source's Value("string") "audio" column (and cast_column can't fix it
+    # after the fact either -- struct->string isn't a valid Arrow cast).
+    # Declaring the target schema up front avoids the mismatch entirely.
+    out_features = Features({"audio": Value("string"), "text": Value("string")})
+    to_drop = [c for c in ds_train.column_names if c not in ("audio", "text")]
+    if not is_hub:
+        return ds_train.map(lambda r: {"audio": str(clips_dir / r["audio"])},
+                            remove_columns=to_drop, features=out_features)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write(r, idx):
+        path = cache_dir / f"{idx:07d}.wav"
+        if not path.exists():
+            audio, sr = sf.read(io.BytesIO(r["audio"]["bytes"]), dtype="float32")
+            sf.write(path, audio, sr)
+        return {"audio": str(path)}
+
+    return ds_train.map(_write, with_indices=True, remove_columns=to_drop, features=out_features)
 
 
 def main():
@@ -152,6 +192,26 @@ def main():
         "to it. Ignored for a Hub --eval-dataset.",
     )
     parser.add_argument(
+        "--extra-dataset", default=None,
+        help="an ADDITIONAL dataset (local path or Hub repo id) whose train split gets "
+        "concatenated onto --dataset's train split -- e.g. train on your own recordings "
+        "plus a broad public corpus at once. Validation stays untouched (--dataset's own "
+        "or --eval-dataset's), so checkpoint selection and W&B still track the one "
+        "validation set you actually care about, not a blend.",
+    )
+    parser.add_argument(
+        "--extra-clips-dir", default=None,
+        help="clips dir for a LOCAL --extra-dataset; defaults to a 'clips' folder next "
+        "to it. Ignored for a Hub --extra-dataset.",
+    )
+    parser.add_argument(
+        "--extra-cache-dir", default=None,
+        help="where to materialize a Hub --extra-dataset's embedded audio to local wav "
+        "files (needed to concatenate with a local-disk --dataset); defaults to "
+        "'hub_cache/<repo-id>' next to --out. Put this on a persistent volume -- rows "
+        "already written there are skipped on the next run.",
+    )
+    parser.add_argument(
         "--features", choices=["auto", "lazy", "precompute"], default="auto",
         help="how log-mel features are produced. precompute caches every clip's features "
         "to disk up front (fast per step, but a large-v3 feature is 1.46 MiB, so 100k "
@@ -220,6 +280,30 @@ def main():
             if not eval_clips_dir.exists():
                 raise SystemExit(f"eval clips dir not found: {eval_clips_dir} (pass --eval-clips-dir)")
         ds["validation"] = eval_ds["validation"]
+
+    if args.extra_dataset:
+        extra_ds, extra_is_hub = load_dataset_dict(args.extra_dataset)
+        extra_clips_dir = None
+        if not extra_is_hub:
+            extra_clips_dir = (Path(args.extra_clips_dir) if args.extra_clips_dir
+                              else Path(args.extra_dataset).parent / "clips")
+            if not extra_clips_dir.exists():
+                raise SystemExit(f"extra clips dir not found: {extra_clips_dir} (pass --extra-clips-dir)")
+        extra_cache_dir = (Path(args.extra_cache_dir) if args.extra_cache_dir
+                           else Path(args.out).parent / "hub_cache" / args.extra_dataset.replace("/", "_"))
+        # primary also needs resolving to the same {audio: abs path, text} schema before
+        # concatenation -- its own cache dir only matters if IT is a Hub dataset too
+        primary_cache_dir = Path(args.out).parent / "hub_cache" / (
+            args.dataset.replace("/", "_") if dataset_is_hub else "primary")
+        n_primary = len(ds["train"])
+        primary_train = resolve_train_to_paths(ds["train"], dataset_is_hub, clips_dir, primary_cache_dir)
+        extra_train = resolve_train_to_paths(extra_ds["train"], extra_is_hub, extra_clips_dir, extra_cache_dir)
+        ds["train"] = concatenate_datasets([primary_train, extra_train])
+        # clips_dir / "<already-absolute-path>" resolves to that absolute path unchanged
+        # (see resolve_train_to_paths docstring), so any placeholder works here
+        clips_dir = Path(".")
+        print(f"combined train: {n_primary} (--dataset) + {len(extra_train)} (--extra-dataset) "
+              f"= {len(ds['train'])} clips", file=sys.stderr)
 
     # Subsample by SHUFFLING first, with a fixed seed. hf_build_dataset.py emits
     # clips grouped by video and ordered by position within it, so a plain .select(range(n))

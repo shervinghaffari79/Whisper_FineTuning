@@ -9,12 +9,18 @@ Decoding uses the same parameters asr_engine.transcribe_chunk does, so the
 number reflects what you would actually ship.
 
 Usage:
+    # local disk (hf_build_dataset.py output)
     python eval_baseline.py --model ./models/whisper-large-v3-persian-ct2-int8 \
-        --dataset ./sm_data/dataset/hf_dataset --limit 200
+        --dataset ./sm_data/collection/hf_dataset --limit 200
+
+    # Hugging Face Hub (audio embedded in the dataset -- no clips dir needed)
+    python eval_baseline.py --model ./models/whisper-large-v3-persian-ct2-int8 \
+        --dataset shervingh2000/behpardaz --limit 200
 
 Requires: faster-whisper, jiwer, datasets, soundfile.
 """
 import argparse
+import io
 import json
 import os
 import sys
@@ -23,13 +29,25 @@ from pathlib import Path
 
 import jiwer
 import soundfile as sf
-from datasets import load_from_disk
+from datasets import Audio, load_dataset, load_from_disk
 
 # Persian orthography varies across sources; without normalizing both sides,
 # WER measures typography rather than recognition quality. Shared with
 # train_whisper.compute_metrics so the in-training number and this one are
 # measuring the same thing -- see fa_text.py.
 from fa_text import normalize_for_wer as normalize_fa
+
+
+def load_split(spec: str, split: str):
+    """spec is a local disk path (a DatasetDict built by hf_build_dataset.py,
+    "audio" column = bare filenames next to a clips/ dir) or a Hugging Face
+    Hub repo id (audio embedded, decode=False to avoid the Audio feature's
+    torchcodec-backed decoder -- same reasoning as train_whisper.load_dataset_dict).
+    Returns (Dataset, is_hub)."""
+    if Path(spec).exists():
+        return load_from_disk(spec)[split], False
+    ds = load_dataset(spec, split=split)
+    return ds.cast_column("audio", Audio(decode=False)), True
 
 
 def main():
@@ -71,10 +89,12 @@ def main():
                  f"from finetune_persian/ that is ../whiper/Whisper/models/<name>.\n"
                  f"Pass a bare name like 'small' to pull from Hugging Face instead.")
 
-    clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
-    if not clips_dir.is_dir():
-        sys.exit(f"clips dir not found: {clips_dir.resolve()} (pass --clips-dir)")
-    ds = load_from_disk(args.dataset)[args.split]
+    ds, is_hub = load_split(args.dataset, args.split)
+    clips_dir = None
+    if not is_hub:
+        clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
+        if not clips_dir.is_dir():
+            sys.exit(f"clips dir not found: {clips_dir.resolve()} (pass --clips-dir)")
     # Shuffle before capping. hf_build_dataset.py emits clips grouped by video and
     # ordered by position within it, so a plain select(range(n)) scores the opening n clips
     # of a single recording -- one speaker, one acoustic condition. The fixed
@@ -93,7 +113,10 @@ def main():
     refs, hyps, rows = [], [], []
     t0 = time.time()
     for i, ex in enumerate(ds):
-        audio, _sr = sf.read(clips_dir / ex["audio"], dtype="float32")
+        if is_hub:
+            audio, _sr = sf.read(io.BytesIO(ex["audio"]["bytes"]), dtype="float32")
+        else:
+            audio, _sr = sf.read(clips_dir / ex["audio"], dtype="float32")
         segments, _ = model.transcribe(
             audio, language="fa", task="transcribe", beam_size=5,
             temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], compression_ratio_threshold=2.4,
@@ -111,7 +134,11 @@ def main():
         # instead. Falling back keeps the per-origin breakdown working for
         # both -- exactly the split you want when the held-out set is a
         # handful of distinct speakers rather than one blended corpus.
-        rows.append({"audio": ex["audio"], "ref": ex["text"], "hyp": hyp,
+        # ex["audio"] is {"bytes", "path"} for a Hub row (decode=False, see
+        # load_split) -- not JSON-serializable and not a useful identifier, so
+        # record its path (or a row number if even that's absent) instead
+        audio_id = ex["audio"].get("path") or f"row{i}" if is_hub else ex["audio"]
+        rows.append({"audio": audio_id, "ref": ex["text"], "hyp": hyp,
                      "source": ex.get("source") or ex.get("video_id")})
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(ds)}  ({(time.time() - t0) / (i + 1):.2f}s/clip)", file=sys.stderr)

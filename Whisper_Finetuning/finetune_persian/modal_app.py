@@ -251,6 +251,9 @@ def train(
     epochs: float = 3.0,
     batch_size: int = 8,
     dataset: str = f"{DATA}/collection/hf_dataset",
+    eval_dataset: str = None,
+    extra_dataset: str = None,
+    extra_cache_dir: str = None,
     max_eval_samples: int = 256,
     early_stopping_patience: int = 3,
     eval_steps: int = 200,
@@ -267,6 +270,15 @@ def train(
     configured with load_best_model_at_end and metric_for_best_model="wer", so a
     run that finishes without ever reaching an eval has no best checkpoint to
     load and fails at the very end -- after paying for all the training.
+
+    extra_dataset concatenates a second dataset's train split onto dataset's
+    (e.g. your own Hub dataset alongside the public HF build) -- see
+    train_whisper.py's --extra-dataset docstring. eval_dataset stays whatever
+    you point it at (typically your own target-domain data) regardless of
+    what extra_dataset adds to training, so checkpoint selection keeps
+    tracking the metric that actually matters. extra_cache_dir defaults to
+    {DATA}/hub_cache/<repo-id> -- on the persistent volume, so a Hub
+    extra_dataset's audio is materialized once and reused across runs.
     """
     report_to_list = [r.strip() for r in report_to.split(",") if r.strip()]
     cmd = ["python", f"{CODE}/train_whisper.py",
@@ -282,6 +294,11 @@ def train(
            "--early-stopping-patience", str(early_stopping_patience),
            "--progress", "never",
            "--report-to", *report_to_list]
+    if eval_dataset:
+        cmd += ["--eval-dataset", eval_dataset]
+    if extra_dataset:
+        cmd += ["--extra-dataset", extra_dataset]
+        cmd += ["--extra-cache-dir", extra_cache_dir or f"{DATA}/hub_cache/{extra_dataset.replace('/', '_')}"]
     if run_name:
         cmd += ["--run-name", run_name]
     if max_train_samples:
@@ -523,3 +540,44 @@ def big(epochs: float = 1.0, batch_size: int = 8, max_train_samples: int = 80000
                      max_train_samples=max_train_samples)
     convert.remote()
     evaluate.remote(dataset=f"{DATA}/blend/hf_dataset")
+
+
+@app.local_entrypoint()
+def combined(
+    own_dataset: str = "shervingh2000/behpardaz",
+    epochs: float = 3.0,
+    batch_size: int = 8,
+    repos: str = DEFAULT_HF_REPOS,
+    max_seconds_per_repo: float = 3600.0,
+    report_to: str = "tensorboard,wandb",
+    run_name: str = None,
+    eval_limit: int = 500,
+):
+    """Train on own_dataset's train split concatenated with a public HF build,
+    while validation tracking during training stays on own_dataset's own
+    validation split (the real target-domain data) -- see train_whisper.py's
+    --extra-dataset docstring for why. After training, reports WER/CER
+    SEPARATELY on each validation set (own_dataset's, then the public build's)
+    rather than a blended number, since a blend isn't comparable run to run as
+    either source's size changes.
+
+    max_seconds_per_repo (default 3600 = 1h/repo, ~6h/~6k clips total) is the
+    "budget-friendly" default -- see the README's Scaling section to go
+    bigger, or modal run --detach modal_app.py::big for the full ~275h corpus.
+    """
+    public_dataset = f"{DATA}/collection/hf_dataset"
+    build_hf_dataset.remote(repos=repos, max_seconds_per_repo=max_seconds_per_repo)
+    train.remote(
+        dataset=public_dataset,
+        extra_dataset=own_dataset,
+        eval_dataset=own_dataset,
+        epochs=epochs,
+        batch_size=batch_size,
+        report_to=report_to,
+        run_name=run_name,
+    )
+    convert.remote()
+    print(f"--- evaluating on {own_dataset} (own validation) ---")
+    evaluate.remote(dataset=own_dataset, limit=eval_limit)
+    print(f"--- evaluating on {public_dataset} (public HF validation) ---")
+    evaluate.remote(dataset=public_dataset, limit=eval_limit)
