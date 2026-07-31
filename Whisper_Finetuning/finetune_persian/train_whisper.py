@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Step 5 -- fine-tune the Persian Whisper checkpoint on the dataset built by
-sm_04_build_dataset.py. Meant for the Windows/T4 box.
+Step 5 -- fine-tune the Persian Whisper checkpoint on a dataset built by
+hf_build_dataset.py (local disk) or pushed straight to the Hugging Face Hub
+(e.g. push_to_hub.py's output). Meant for the Windows/T4 box.
 
 Continues from AmirMohseni/whisper-large-v3-persian-bf16 (the same base the
 production CT2 model was converted from) so the result stays a drop-in
@@ -13,12 +14,18 @@ and it regularizes against overfitting on small datasets), or at minimum
 --optim adamw_bnb_8bit.
 
 Usage:
-    python train_whisper.py --dataset ./sm_data/dataset/hf_dataset --out ./run1 --use-lora
+    # local disk (a DatasetDict saved by hf_build_dataset.py, with a sibling
+    # clips/ folder of audio files -- --dataset's "audio" column is filenames)
+    python train_whisper.py --dataset ./sm_data/collection/hf_dataset --out ./run1 --use-lora
+
+    # Hugging Face Hub (audio embedded in the dataset -- no clips dir needed)
+    python train_whisper.py --dataset shervingh2000/behpardaz --out ./run1 --use-lora
 
 Requires: torch (CUDA build), transformers, datasets, accelerate, evaluate,
 jiwer, soundfile, and peft when --use-lora is set.
 """
 import argparse
+import io
 import sys
 from pathlib import Path
 
@@ -28,7 +35,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import transformers
-from datasets import load_from_disk
+from datasets import Audio, load_dataset, load_from_disk
 from transformers import (
     EarlyStoppingCallback,
     Seq2SeqTrainer,
@@ -40,9 +47,35 @@ from transformers import (
 from fa_text import normalize_for_wer
 
 
+def load_dataset_dict(spec: str):
+    """spec is a local disk path (a DatasetDict saved by hf_build_dataset.py,
+    "audio" column = bare filenames next to a clips/ dir) or a Hugging Face
+    Hub repo id (e.g. shervingh2000/behpardaz -- "audio" column is an Audio
+    feature with the clip bytes embedded, no clips dir applies).
+
+    A repo id never resolves to an existing local path, so that's the switch:
+    local disk if the path exists, Hub otherwise. Returns (DatasetDict, is_hub).
+
+    Hub splits get decode=False cast onto "audio": the datasets library's own
+    Audio decoder now requires torchcodec, whose bundled FFmpeg libs don't
+    link on every platform (the same reason the local-disk path below reads
+    clips with soundfile directly instead of the Audio feature). decode=False
+    hands back {"bytes", "path"} instead, which make_prepare/make_batch_prepare
+    decode with soundfile themselves, same as hf_build_dataset.decode_row_audio.
+    """
+    if Path(spec).exists():
+        return load_from_disk(spec), False
+    ds = load_dataset(spec)
+    for split in ds:
+        ds[split] = ds[split].cast_column("audio", Audio(decode=False))
+    return ds, True
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="./sm_data/dataset/hf_dataset")
+    parser.add_argument("--dataset", default="./sm_data/collection/hf_dataset",
+                        help="local disk path (hf_build_dataset.py output) or a "
+                        "Hugging Face Hub dataset repo id (e.g. shervingh2000/behpardaz)")
     parser.add_argument("--base-model", default="AmirMohseni/whisper-large-v3-persian-bf16")
     parser.add_argument("--out", default="./run1")
     parser.add_argument("--language", default="persian")
@@ -101,21 +134,22 @@ def main():
                         help="seeds training and the --max-*-samples subsets")
     parser.add_argument(
         "--clips-dir", default=None,
-        help="dir holding the audio clips referenced by the dataset; defaults to a "
-        "'clips' folder next to --dataset (where sm_04 puts them)",
+        help="dir holding the audio clips referenced by a LOCAL --dataset; defaults to "
+        "a 'clips' folder next to it. Ignored for a Hub --dataset (audio is embedded).",
     )
     parser.add_argument(
         "--eval-dataset", default=None,
-        help="use this dataset's 'validation' split for eval instead of --dataset's own. "
-        "For training on a broad corpus (e.g. hf_build_dataset.py output) while still "
-        "tracking WER on your real target-domain validation set -- otherwise the metric "
-        "driving checkpoint selection and early stopping stops reflecting what you "
-        "actually care about, and you can't tell a broad-domain gain from a target-"
-        "domain regression.",
+        help="use this dataset's 'validation' split for eval instead of --dataset's own "
+        "(local path or Hub repo id, same rules as --dataset). For training on a broad "
+        "corpus while still tracking WER on your real target-domain validation set -- "
+        "otherwise the metric driving checkpoint selection and early stopping stops "
+        "reflecting what you actually care about, and you can't tell a broad-domain "
+        "gain from a target-domain regression.",
     )
     parser.add_argument(
         "--eval-clips-dir", default=None,
-        help="clips dir for --eval-dataset; defaults to a 'clips' folder next to it",
+        help="clips dir for a LOCAL --eval-dataset; defaults to a 'clips' folder next "
+        "to it. Ignored for a Hub --eval-dataset.",
     )
     parser.add_argument(
         "--features", choices=["auto", "lazy", "precompute"], default="auto",
@@ -169,21 +203,26 @@ def main():
     if not show_bar:
         hf_datasets.disable_progress_bars()
 
-    clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
-    if not clips_dir.exists():
-        raise SystemExit(f"clips dir not found: {clips_dir} (pass --clips-dir)")
+    ds, dataset_is_hub = load_dataset_dict(args.dataset)
+    clips_dir = None
+    if not dataset_is_hub:
+        clips_dir = Path(args.clips_dir) if args.clips_dir else Path(args.dataset).parent / "clips"
+        if not clips_dir.exists():
+            raise SystemExit(f"clips dir not found: {clips_dir} (pass --clips-dir)")
 
-    ds = load_from_disk(args.dataset)
     eval_clips_dir = clips_dir
     if args.eval_dataset:
-        eval_clips_dir = (Path(args.eval_clips_dir) if args.eval_clips_dir
-                          else Path(args.eval_dataset).parent / "clips")
-        if not eval_clips_dir.exists():
-            raise SystemExit(f"eval clips dir not found: {eval_clips_dir} (pass --eval-clips-dir)")
-        ds["validation"] = load_from_disk(args.eval_dataset)["validation"]
+        eval_ds, eval_is_hub = load_dataset_dict(args.eval_dataset)
+        eval_clips_dir = None
+        if not eval_is_hub:
+            eval_clips_dir = (Path(args.eval_clips_dir) if args.eval_clips_dir
+                              else Path(args.eval_dataset).parent / "clips")
+            if not eval_clips_dir.exists():
+                raise SystemExit(f"eval clips dir not found: {eval_clips_dir} (pass --eval-clips-dir)")
+        ds["validation"] = eval_ds["validation"]
 
-    # Subsample by SHUFFLING first, with a fixed seed. sm_04 emits clips grouped
-    # by video and ordered by position within it, so a plain .select(range(n))
+    # Subsample by SHUFFLING first, with a fixed seed. hf_build_dataset.py emits
+    # clips grouped by video and ordered by position within it, so a plain .select(range(n))
     # would hand back the opening n clips of whichever video sorts first -- one
     # speaker, one topic, one recording condition. Capping eval that way makes
     # the WER faster and meaningless at the same time. The fixed seed keeps the
@@ -201,10 +240,16 @@ def main():
 
     def make_prepare(audio_dir):
         def prepare(batch):
-            # read the clip with soundfile rather than datasets' Audio feature:
-            # the Audio feature now requires torchcodec, whose bundled FFmpeg libs
-            # don't link on every platform, and we already know these are 16kHz mono
-            audio, sr = sf.read(audio_dir / batch["audio"], dtype="float32")
+            if audio_dir is None:
+                # Hub dataset: "audio" is {"bytes", "path"} (decode=False, see
+                # load_dataset_dict) -- decode with soundfile ourselves, same
+                # avoidance of the torchcodec-backed Audio decoder as below
+                audio, sr = sf.read(io.BytesIO(batch["audio"]["bytes"]), dtype="float32")
+            else:
+                # read the clip with soundfile rather than datasets' Audio feature:
+                # the Audio feature now requires torchcodec, whose bundled FFmpeg libs
+                # don't link on every platform, and we already know these are 16kHz mono
+                audio, sr = sf.read(audio_dir / batch["audio"], dtype="float32")
             batch["input_features"] = processor.feature_extractor(
                 audio, sampling_rate=sr
             ).input_features[0]
@@ -218,7 +263,10 @@ def main():
         def transform(batch):
             feats, labels = [], []
             for name, text in zip(batch["audio"], batch["text"]):
-                audio, sr = sf.read(audio_dir / name, dtype="float32")
+                if audio_dir is None:
+                    audio, sr = sf.read(io.BytesIO(name["bytes"]), dtype="float32")
+                else:
+                    audio, sr = sf.read(audio_dir / name, dtype="float32")
                 feats.append(processor.feature_extractor(
                     audio, sampling_rate=sr).input_features[0])
                 labels.append(processor.tokenizer(text).input_ids)
@@ -239,10 +287,9 @@ def main():
         ds["validation"].set_transform(make_batch_prepare(eval_clips_dir))
     else:
         # mapped per-split rather than over the whole DatasetDict at once: train and
-        # validation can now come from different clip directories (--eval-dataset),
-        # and hf_build_dataset.py's manifest columns (audio/text/source/duration)
-        # differ from sm_04's (audio/text/video_id/start/duration/confidence) -- a
-        # single remove_columns list across both splits breaks the moment they diverge
+        # validation can now come from different sources (--eval-dataset, local or
+        # Hub), and their manifest columns can differ -- a single remove_columns
+        # list across both splits breaks the moment they diverge
         est = n_clips * 128 * 3000 * 4 / 1024 ** 3
         print(f"features: precomputed to cache for {n_clips} clips (~{est:.0f} GiB)",
               file=sys.stderr)
@@ -282,10 +329,10 @@ def main():
 
         # Score on normalized text, the same normalization eval_baseline.py
         # applies, so the two WERs are comparable. Unnormalized, every comma
-        # the model places differently is a full word substitution -- sm_04
-        # attaches punctuation to the preceding word -- which buries the
-        # recognition signal this metric is supposed to expose and, because
-        # metric_for_best_model="wer", drags checkpoint selection with it.
+        # the model places differently is a full word substitution -- the
+        # label text attaches punctuation to the preceding word -- which
+        # buries the recognition signal this metric is supposed to expose and,
+        # because metric_for_best_model="wer", drags checkpoint selection with it.
         refs = [normalize_for_wer(s) for s in label_str]
         hyps = [normalize_for_wer(s) for s in pred_str]
         keep = [i for i, r in enumerate(refs) if r.strip()]

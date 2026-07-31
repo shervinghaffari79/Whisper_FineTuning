@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Alternate Step 4 -- build a Whisper fine-tuning dataset from pre-segmented
-Hugging Face datasets (e.g. the MohammadGholizadeh Persian YouTube/podcast
-collection) instead of from Speechmatics output. Produces the same on-disk
-shape sm_04_build_dataset.py does (HF DatasetDict of {audio: filename, text}
-plus a sibling clips/ folder), so train_whisper.py needs no changes.
+Build a Whisper fine-tuning dataset from pre-segmented Hugging Face datasets
+(e.g. the MohammadGholizadeh Persian YouTube/podcast collection, or your own
+pushed dataset). Produces an HF DatasetDict of {audio: filename, text} plus a
+sibling clips/ folder, the shape train_whisper.py and push_to_hub.py expect.
 
 These repos already ship one row per utterance with wav audio and a text
 column -- there is nothing to segment. What differs per source is the text
@@ -19,10 +18,9 @@ this collection is ~132GB.
 
 A repo with no video/episode id column and only a "train" split (i.e. every
 podcast/channel repo here) is, for leakage purposes, ONE recording -- there
-is no source column to split on the way sm_04 splits by video_id. The
-fallback is a tail slice of --val-fraction, mirroring the single-video
-fallback in sm_04_build_dataset.py. It is not as clean as a held-out
-recording, but it is what's available without re-diarizing the source.
+is no source column to split on. The fallback is a tail slice of
+--val-fraction. It is not as clean as a held-out recording, but it is what's
+available without re-diarizing the source.
 
 Usage:
     python hf_build_dataset.py \
@@ -32,6 +30,10 @@ Usage:
 
 Requires: datasets, soundfile, plus ffmpeg on PATH for any source whose audio
 container soundfile can't decode directly.
+
+For a private repo, set HF_TOKEN in the environment before running -- a repo
+with no video/episode/id column also needs --id-column matching whatever
+column names the recording.
 """
 import argparse
 import io
@@ -45,7 +47,7 @@ from pathlib import Path
 import soundfile as sf
 from datasets import Audio, Dataset, DatasetDict, load_dataset
 
-from sm_04_build_dataset import normalize_fa
+from fa_text import normalize_fa
 
 SAMPLE_RATE = 16000
 
@@ -55,7 +57,7 @@ def decode_row_audio(raw: dict):
     decode=False so this never touches the Audio feature's torchcodec-backed
     decoder (see the same avoidance in train_whisper.prepare). soundfile
     handles the wav/flac case directly; anything else falls back to ffmpeg,
-    same tool sm_04 already requires on this box."""
+    which must be on PATH."""
     try:
         audio, sr = sf.read(io.BytesIO(raw["bytes"]), dtype="float32")
     except Exception:
@@ -138,9 +140,8 @@ def main():
     parser.add_argument(
         "--id-column", default="auto",
         help="column identifying the source recording (auto | none | NAME). When present, "
-        "validation holds out whole recordings the way sm_04_build_dataset.py holds out "
-        "whole videos, instead of tail-slicing. 'auto' probes the first row for "
-        "video_id/episode_id/id.",
+        "validation holds out whole recordings instead of tail-slicing. 'auto' probes "
+        "the first row for video_id/episode_id/id.",
     )
     parser.add_argument("--min-sec", type=float, default=0.3)
     parser.add_argument("--max-sec", type=float, default=28.0)
@@ -172,7 +173,11 @@ def main():
         repo, text_col, split = parse_repo_spec(spec)
         tag = repo.split("/")[-1]
         print(f"[{tag}] streaming split={split} (text_col={text_col}) ...", file=sys.stderr)
-        ds = load_dataset(repo, split=split, streaming=True)
+        # HF_TOKEN is unset for the public MohammadGholizadeh repos this was
+        # written against; token=None there is the same unauthenticated
+        # request datasets would make anyway. Only your own private repo needs it.
+        ds = load_dataset(repo, split=split, streaming=True,
+                          token=os.environ.get("HF_TOKEN"))
         ds = ds.cast_column("audio", Audio(decode=False))
 
         has_named_val = split in ("validation", "val", "test")
@@ -240,7 +245,7 @@ def main():
         if has_named_val:
             val_rows.extend(rows)
         elif id_col and any(r["_gid"] for r in rows):
-            # Hold out WHOLE recordings, like sm_04 does by video_id. A tail slice
+            # Hold out WHOLE recordings by video_id. A tail slice
             # would leak here: this repo's train split is shuffled across videos
             # (consecutive rows carry different ids), so its last N rows belong to
             # videos that are also in the training portion -- the model would be
@@ -270,7 +275,7 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     # _gid is bookkeeping for the split above; drop it so the saved columns match
-    # what sm_04_build_dataset.py and blend_datasets.py emit
+    # what blend_datasets.py emits
     strip = lambda rs: [{k: v for k, v in r.items() if k != "_gid"} for r in rs]
     # only emit splits that actually have rows -- pulling a repo's own val split
     # on its own (--repo ...:transcription:val) is a legitimate way to source a

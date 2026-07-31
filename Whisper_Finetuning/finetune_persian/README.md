@@ -107,31 +107,23 @@ modal run modal_app.py --repos "MohammadGholizadeh/youtube-farsi:transcription:t
 
 ## Where the data comes from
 
-Public Persian YouTube/podcast corpora — the
-[MohammadGholizadeh collection](https://huggingface.co/collections/MohammadGholizadeh/persian-youtube-asr-datasets),
-which is what `hf_build_dataset.py` was written against. Six repos, ~713h total,
-~260GB of parquet. It is **streamed**, and `--max-seconds-per-repo` stops each
-stream once it has enough — without that budget you would pull all 260GB.
+Two sources, both consumed the same way by `train_whisper.py` (a local disk
+path or a Hugging Face Hub repo id — see [Local / non-Modal use](#local--non-modal-use)):
 
-Only `youtube-farsi` has a `video_id`, so it gets a proper held-out-by-recording
-validation split. The podcast repos are a single `train` split with no recording
-id, so they are tail-sliced — same speaker on both sides, which is weaker but is
-what is available without re-diarizing.
+- **Public Persian YouTube/podcast corpora** — the
+  [MohammadGholizadeh collection](https://huggingface.co/collections/MohammadGholizadeh/persian-youtube-asr-datasets),
+  which is what `hf_build_dataset.py` was written against. Six repos, ~713h total,
+  ~260GB of parquet. It is **streamed**, and `--max-seconds-per-repo` stops each
+  stream once it has enough — without that budget you would pull all 260GB.
 
-### Why not the original YouTube data
+  Only `youtube-farsi` has a `video_id`, so it gets a proper held-out-by-recording
+  validation split. The podcast repos are a single `train` split with no recording
+  id, so they are tail-sliced — same speaker on both sides, which is weaker but is
+  what is available without re-diarizing.
 
-`sm_data/links.jsonl` is dead and cannot rebuild a dataset from any machine:
-
-- 6 of 14 links time out (`cdn.imgurl.ir`)
-- 6 return HTTP 403 (`uupload.ir`) — not fixable with a browser UA, a `Referer`,
-  or percent-encoding the `+` in the paths; all were tried
-- `val_a/b/c` have transcripts but **no entry in `links.jsonl` at all**, so the
-  validation split has no audio source either way
-
-The `sm_*` stages (`seed_data`, `download_audio`, `transcribe`, `build_dataset`)
-are still wired up for the day those links come back. If you have the `.m4a`
-files, `modal volume put whisper-persian-data ./audio /audio` skips the dead
-links entirely and the original `sm_04` path runs unchanged.
+- **Your own recordings**, pushed to the Hub with `push_to_hub.py` (see its
+  module docstring) and passed straight to `train()`/`evaluate()` via
+  `--dataset <repo id>` — e.g. `shervingh2000/behpardaz`.
 
 ### Data quality: `kouman`
 
@@ -206,8 +198,21 @@ secret you never created, or a `gpu=` your workspace is not entitled to, kills
 surfaces as a bare `CancelledError`, because the concurrent image build gets
 cancelled before the real `NotFoundError` can print. If you get an instant
 `CancelledError` with no useful message, suspect this first, and bisect by
-running a trivial function. Both known cases are opt-in here
-(`ENABLE_TRANSCRIBE=1`, `BIG_GPU=`).
+running a trivial function.
+
+Concretely: **`train()` always has the `wandb` secret attached**, even if
+`--report-to` never includes wandb — so that secret must exist before *any*
+call to `modal_app.py::train` succeeds:
+
+```bash
+modal secret create wandb WANDB_API_KEY=...
+```
+
+(It isn't gated behind a flag on purpose — toggling a function's secrets list
+between `modal run` invocations of the same app hits a different failure,
+"Function has N dependencies but container got N+1 object ids"; see the
+`_wandb_secrets` comment in `modal_app.py`.) A bigger `BIG_GPU=` is opt-in the
+normal way, gated behind that env var.
 
 **`ctranslate2` needs CUDA 12; torch now ships CUDA 13.** `libcublas.so.13`
 exists, `libcublas.so.12` is what gets dlopened — at the *first encode*, long
@@ -262,12 +267,16 @@ Every script runs standalone; `modal_app.py` only chooses where. See each
 script's module docstring for its flags. The pipeline order is:
 
 ```
-sm_01_extract_links → sm_02_download → sm_03_transcribe → sm_04_build_dataset ─┐
-                                        (or sm_03b_import_transcripts)         │
-                                                                               ├→ train_whisper → convert_to_ct2 → eval_baseline
-hf_build_dataset (Hugging Face sources) ───────────────────────────────────────┘
-                                    ↑ blend_datasets merges multiple of these
+hf_build_dataset (Hugging Face sources) ─┐
+                                          ├→ train_whisper → convert_to_ct2 → eval_baseline
+push_to_hub (your own recordings) ───────┘      ↑
+                          blend_datasets merges multiple local builds
 ```
+
+`train_whisper.py --dataset` and `--eval-dataset` each accept either a local
+disk path (a DatasetDict built by `hf_build_dataset.py`, with a sibling
+`clips/` folder) or a Hugging Face Hub dataset repo id (audio embedded, no
+clips dir needed) — e.g. `--dataset shervingh2000/behpardaz`.
 
 Diagnostics: `report_run.py` (training curves), `peek_checkpoint.py` (mid-run
 sanity check), `diagnose_ct2.py` (inspect a converted model).

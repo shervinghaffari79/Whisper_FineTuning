@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Step 4b -- push the local Whisper dataset (built by sm_04_build_dataset.py from
-sm_data/audio + sm_data/transcripts) to the Hugging Face Hub.
+Push a local Whisper dataset (built by hf_build_dataset.py) to the Hugging
+Face Hub.
 
-sm_04_build_dataset.py's on-disk shape is a DatasetDict whose "audio" column
+hf_build_dataset.py's on-disk shape is a DatasetDict whose "audio" column
 holds bare clip filenames, with the actual wav files in a sibling clips/
 folder -- not something push_to_hub can upload directly. This resolves each
 filename to its real path and casts the column to an Audio feature so the
@@ -15,9 +15,9 @@ One-time setup:
     huggingface-cli login          # needs a token with write access
 
 Usage:
-    python sm_04_build_dataset.py --audio ./sm_data/audio \
-        --transcripts ./sm_data/transcripts --out ./sm_data/dataset
-    python push_to_hub.py --dataset ./sm_data/dataset --repo shervingh2000/behpardaz
+    python hf_build_dataset.py --out ./sm_data/collection \
+        --repo MohammadGholizadeh/youtube-farsi:transcription:train
+    python push_to_hub.py --dataset ./sm_data/collection/hf_dataset --repo shervingh2000/behpardaz
 """
 import argparse
 from pathlib import Path
@@ -27,14 +27,14 @@ from datasets import Audio, load_from_disk
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="./sm_data/dataset/hf_dataset",
-                        help="local DatasetDict built by sm_04_build_dataset.py "
+    parser.add_argument("--dataset", default="./sm_data/collection/hf_dataset",
+                        help="local DatasetDict built by hf_build_dataset.py "
                         "(that script writes it to <out>/hf_dataset, with clips as a "
                         "sibling <out>/clips -- NOT a child of the dataset dir)")
     parser.add_argument("--clips-dir", default=None,
                         help="dir holding the audio clips referenced by --dataset; "
                         "defaults to a 'clips' folder next to (not inside) it, matching "
-                        "sm_04_build_dataset.py's layout")
+                        "hf_build_dataset.py's layout")
     parser.add_argument("--repo", default="shervingh2000/behpardaz")
     parser.add_argument("--private", action="store_true",
                         help="push as a private dataset repo")

@@ -75,8 +75,8 @@ def main():
     if not clips_dir.is_dir():
         sys.exit(f"clips dir not found: {clips_dir.resolve()} (pass --clips-dir)")
     ds = load_from_disk(args.dataset)[args.split]
-    # Shuffle before capping. sm_04 emits clips grouped by video and ordered by
-    # position within it, so a plain select(range(n)) scores the opening n clips
+    # Shuffle before capping. hf_build_dataset.py emits clips grouped by video and
+    # ordered by position within it, so a plain select(range(n)) scores the opening n clips
     # of a single recording -- one speaker, one acoustic condition. The fixed
     # seed keeps the subset identical between the baseline run and the
     # fine-tuned run, which is the only thing that makes the two comparable.
@@ -106,11 +106,10 @@ def main():
             continue
         refs.append(ref_n)
         hyps.append(hyp_n)
-        # hf_build_dataset.py/blend_datasets.py name the origin "source"; the
-        # sm_04 path has no such column and identifies the recording by
-        # "video_id" instead. Falling back keeps the per-origin breakdown
-        # working for both, which for an sm_04 build means one row per
-        # recording -- exactly the split you want when the held-out set is a
+        # hf_build_dataset.py/blend_datasets.py name the origin "source"; some
+        # builds have no such column and identify the recording by "video_id"
+        # instead. Falling back keeps the per-origin breakdown working for
+        # both -- exactly the split you want when the held-out set is a
         # handful of distinct speakers rather than one blended corpus.
         rows.append({"audio": ex["audio"], "ref": ex["text"], "hyp": hyp,
                      "source": ex.get("source") or ex.get("video_id")})

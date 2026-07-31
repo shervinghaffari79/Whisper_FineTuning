@@ -4,10 +4,9 @@ Step 4c -- blend several built datasets into one, so stage-2 training can add
 broad corpora WITHOUT dropping the original domain, and so the validation set
 can grow by appending new voices to the ones already there.
 
-Consumes and produces the same on-disk shape as sm_04_build_dataset.py and
-hf_build_dataset.py (an HF DatasetDict of {audio: filename, text: str} plus a
-sibling clips/ folder), so train_whisper.py and eval_baseline.py read the
-output with no changes.
+Consumes and produces the same on-disk shape as hf_build_dataset.py (an HF
+DatasetDict of {audio: filename, text: str} plus a sibling clips/ folder), so
+train_whisper.py and eval_baseline.py read the output with no changes.
 
 Why blend rather than just train on the new corpus: a LoRA adapter is ~15.7M
 trainable params. Several thousand steps of differently-styled audio can
