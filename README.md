@@ -109,6 +109,12 @@ The pre-wired chains — `modal run --detach modal_app.py::<name>`:
 | `build_all` | six `build_one_repo` in parallel `→ blend` | phase 1 of scaling up, split out since `--detach` only survives the *last* triggered function |
 | `big` | `build_all`'s chain `→ train_big → convert → evaluate` | the full ~275h corpus in one call — see [Scaling](#scaling) |
 
+`main`, `combined`, and `big` all chain multiple stages through one local
+process -- convenient for a quick run, but the *local* process still has to
+survive the whole thing (training included) for later stages to fire. For
+anything long enough to matter, trigger each stage as its own separate
+`modal run --detach` call instead -- see the `--detach` gotcha below.
+
 Useful flags:
 
 ```bash
@@ -271,6 +277,35 @@ the Trainer raises before step 1.
 **`--detach` keeps only the *last* triggered function alive.** A single
 entrypoint chaining build → blend → train can lose the tail when the local
 process goes away, which is why `build_all` and `train_big` are separate.
+
+The same risk applies to `combined` and `big` -- both chain 5 remote calls
+(build → train → convert → evaluate[×1 or ×2]) through one local Python
+process via blocking `.remote()` calls. `--detach` protects the *App* from a
+dropped connection (proven: a build survived a 20-minute local network outage
+here, unaffected), but if the *local process itself* dies mid-chain --
+crashes, the machine sleeps, a terminal closes without `nohup` -- only
+whichever function was already in flight finishes; anything later in the
+chain simply never gets triggered, silently.
+
+For a run long enough to matter (training is always the long pole), trigger
+each stage as its **own separate** `modal run --detach` call instead of the
+combined entrypoint, so no single process has to survive the whole thing:
+
+```bash
+modal run --detach modal_app.py::build_hf_dataset   # skip if already built -- check first:
+modal volume ls whisper-persian-data collection/hf_dataset
+
+modal run --detach modal_app.py::train --dataset /data/collection/hf_dataset \
+    --extra-dataset shervingh2000/behpardaz --eval-dataset shervingh2000/behpardaz
+# wait for it to finish (see "Training progress does not stream reliably" below), then:
+
+modal run --detach modal_app.py::convert
+modal run --detach modal_app.py::evaluate --dataset shervingh2000/behpardaz --limit 500
+modal run --detach modal_app.py::evaluate --dataset /data/collection/hf_dataset --limit 500
+```
+
+Each stage writes to the persistent volume before the next one needs it, so
+this is exactly equivalent to `combined` -- just resumable at any point.
 
 **Training progress does not stream reliably.** Output buffers through the
 detached CLI and can look stalled for an hour while everything is fine. Check the
