@@ -1,6 +1,0 @@
-# Steps sm_01..sm_04 (dataset building). Run on the server.
-# ffmpeg must also be on PATH (sm_04 decodes m4a -> 16kHz mono wav).
-requests
-soundfile
-numpy
-datasets
