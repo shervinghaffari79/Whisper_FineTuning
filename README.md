@@ -26,8 +26,9 @@ cd finetune_persian
 modal run --detach modal_app.py
 ```
 
-That runs the whole thing: build a ~6h dataset → LoRA fine-tune on an A10G →
-merge and convert to CT2 → score WER. Expect **~3–4 hours**, most of it training.
+That runs the whole thing: build a ~12h dataset → LoRA fine-tune on an A10G →
+merge and convert to CT2 → score WER. Expect **~6–7 hours**, most of it training
+(~5.6h train+eval on the A10G alone, at ~7.6 s/step).
 
 No secrets are required. The datasets and the base model are public.
 
@@ -44,7 +45,10 @@ export CT2_MODEL_DIR=$PWD/models/whisper-persian-ct2-int8
 
 ## Results from the reference run
 
-6,748 clips / 6.0h of audio, LoRA, 3 epochs, ~2.4h on an A10G:
+From before `--max-seconds-per-repo`'s default doubled from 3600s (1h/repo) to
+7200s (2h/repo) -- these numbers are from the smaller build and haven't been
+re-measured at the new default yet. 6,748 clips / 6.0h of audio, LoRA, 3
+epochs, ~2.4h on an A10G:
 
 | Stage | WER |
 |---|---|
@@ -79,7 +83,7 @@ the previous one's work.
 
 | Stage | Hardware | Writes | Notes |
 |---|---|---|---|
-| `build_hf_dataset` | 8 CPU | `/data/collection` | streams HF repos, ~1h audio each |
+| `build_hf_dataset` | 8 CPU | `/data/collection` | streams HF repos, ~2h audio each |
 | `train` | A10G | `/data/run1` | LoRA, 3 epochs |
 | `convert` | 4 CPU / 32GB | `/data/models/...` | merges adapter, quantizes |
 | `evaluate` | T4 | — | WER/CER + per-source table |
@@ -108,8 +112,8 @@ The pre-wired chains — `modal run --detach modal_app.py::<name>`:
 Useful flags:
 
 ```bash
-# more audio per repo (default 3600s of kept audio each)
-modal run modal_app.py --max-seconds-per-repo 7200
+# more audio per repo (default 7200s = 2h of kept audio each)
+modal run modal_app.py --max-seconds-per-repo 14400
 
 # one repo only
 modal run modal_app.py --repos "MohammadGholizadeh/youtube-farsi:transcription:train"
@@ -154,7 +158,7 @@ source's size changes.
 ```bash
 # override the defaults
 modal run --detach modal_app.py::combined --own-dataset shervingh2000/behpardaz \
-    --max-seconds-per-repo 3600 --epochs 3
+    --max-seconds-per-repo 14400 --epochs 2
 ```
 
 Calling `train()` directly gives the same building blocks individually:
@@ -189,7 +193,7 @@ speaker labels (noise) but `(BPM)` for spoken parentheticals (not noise).
 
 ## Scaling
 
-The reference run uses 1h per repo. To go bigger:
+The reference run uses 2h per repo. To go bigger:
 
 ```bash
 modal run --detach modal_app.py::build_all      # ~275h, 6 repos in parallel, then blend
@@ -293,9 +297,9 @@ Rough shape of the reference run (check
 [Modal's pricing](https://modal.com/pricing) for current rates):
 
 - image build: ~80s, once, then cached
-- dataset build (6h audio): ~30 min on CPU
-- training: ~2.4h on one A10G
-- convert + evaluate: ~15 min
+- dataset build (12h audio): ~45–60 min on CPU
+- training: ~4.9h + ~0.7h eval overhead on one A10G
+- convert + evaluate: ~20–30 min
 
 The free tier covers the A10G. A100/H100 requires a payment method.
 

@@ -174,7 +174,7 @@ _wandb_secrets = [modal.Secret.from_name("wandb")]
 
 
 @app.function(image=image, volumes={DATA: volume}, cpu=8.0, timeout=6 * 3600)
-def build_hf_dataset(repos: str = DEFAULT_HF_REPOS, max_seconds_per_repo: float = 3600.0):
+def build_hf_dataset(repos: str = DEFAULT_HF_REPOS, max_seconds_per_repo: float = 7200.0):
     """Build the training set by streaming the Hugging Face collection.
 
     Streams each repo and stops at the per-repo budget, so this never pulls the
@@ -496,7 +496,7 @@ def main(
     epochs: float = 3.0,
     batch_size: int = 8,
     repos: str = DEFAULT_HF_REPOS,
-    max_seconds_per_repo: float = 3600.0,
+    max_seconds_per_repo: float = 7200.0,
     report_to: str = "tensorboard,wandb",
     run_name: str = None,
 ):
@@ -548,7 +548,7 @@ def combined(
     epochs: float = 3.0,
     batch_size: int = 8,
     repos: str = DEFAULT_HF_REPOS,
-    max_seconds_per_repo: float = 3600.0,
+    max_seconds_per_repo: float = 7200.0,
     report_to: str = "tensorboard,wandb",
     run_name: str = None,
     eval_limit: int = 500,
@@ -561,8 +561,8 @@ def combined(
     rather than a blended number, since a blend isn't comparable run to run as
     either source's size changes.
 
-    max_seconds_per_repo (default 3600 = 1h/repo, ~6h/~6k clips total) is the
-    "budget-friendly" default -- see the README's Scaling section to go
+    max_seconds_per_repo (default 7200 = 2h/repo, ~12h/~12k clips total) is
+    the "budget-friendly" default -- see the README's Scaling section to go
     bigger, or modal run --detach modal_app.py::big for the full ~275h corpus.
     """
     public_dataset = f"{DATA}/collection/hf_dataset"
