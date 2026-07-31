@@ -255,7 +255,7 @@ def train(
     extra_dataset: str = None,
     extra_cache_dir: str = None,
     max_eval_samples: int = 256,
-    early_stopping_patience: int = 3,
+    early_stopping_patience: int = 8,
     eval_steps: int = 200,
     max_train_samples: int = 0,
     out: str = f"{DATA}/run1",
@@ -270,6 +270,18 @@ def train(
     configured with load_best_model_at_end and metric_for_best_model="wer", so a
     run that finishes without ever reaching an eval has no best checkpoint to
     load and fails at the very end -- after paying for all the training.
+
+    early_stopping_patience's default is a STEP count (patience * eval_steps),
+    not an epoch fraction, so it silently gets stingier as the dataset grows --
+    the 3 this used to default to was ~1.6 epochs of runway against the
+    original ~6k-clip public build (600 steps / ~380 steps-per-epoch), but only
+    ~0.45 epochs against a combined own+public run of ~21k clips (600 / ~1328).
+    That combination stopped at epoch 0.9 having last improved at epoch 0.45 --
+    early stopping doing exactly what it's told, just against a patience budget
+    sized for a dataset a third this big. 8 gives ~1.2 epochs of runway at
+    today's combined size; if you change --dataset/--extra-dataset enough to
+    meaningfully shift the clip count, reconsider this alongside eval_steps
+    rather than assuming it still scales.
 
     extra_dataset concatenates a second dataset's train split onto dataset's
     (e.g. your own Hub dataset alongside the public HF build) -- see
