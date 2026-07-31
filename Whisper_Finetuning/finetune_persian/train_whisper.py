@@ -133,6 +133,15 @@ def main():
         "process (safe everywhere); 2-4 helps if extraction ever becomes the bottleneck, "
         "but worker spawn is slow on Windows",
     )
+    parser.add_argument(
+        "--report-to", nargs="+", default=["tensorboard"],
+        help="Trainer logging backends, e.g. --report-to tensorboard wandb. wandb needs "
+        "WANDB_API_KEY in the environment (and WANDB_PROJECT/--run-name to organize runs).",
+    )
+    parser.add_argument(
+        "--run-name", default=None,
+        help="run name for backends that group by run (e.g. wandb); defaults to --out's basename",
+    )
     args = parser.parse_args()
 
     if args.init_adapter and not args.use_lora:
@@ -356,7 +365,8 @@ def main():
         # sparsely; without one these lines ARE the progress signal
         logging_steps=50 if show_bar else 10,
         disable_tqdm=not show_bar,
-        report_to=["tensorboard"],
+        report_to=args.report_to,
+        run_name=args.run_name or Path(args.out).name,
         load_best_model_at_end=True,
         metric_for_best_model="wer",
         greater_is_better=False,

@@ -13,6 +13,13 @@ if you add NEW links to sm_data/links.jsonl:
     modal secret create speechmatics SM_API_KEY=...
     ENABLE_TRANSCRIBE=1 modal run modal_app.py::transcribe
 
+To track a training run on Weights & Biases instead of (or alongside)
+TensorBoard (the wandb secret must exist -- train() always has it attached,
+see the _wandb_secrets note below for why it isn't gated behind a flag):
+
+    modal secret create wandb WANDB_API_KEY=...
+    modal run modal_app.py::train --report-to tensorboard,wandb
+
 Data source: the Hugging Face Persian YouTube/podcast collection, NOT the
 sm_02 download path. The audio links in sm_data/links.jsonl have rotted --
 6 of 14 time out (cdn.imgurl.ir), 6 return 403 (uupload.ir), and the val_a/b/c
@@ -91,7 +98,7 @@ _base = (
     .pip_install(
         "requests", "soundfile", "numpy", "datasets", "huggingface_hub",
         "torch", "transformers", "accelerate", "evaluate", "jiwer",
-        "peft", "ctranslate2", "faster-whisper",
+        "peft", "ctranslate2", "faster-whisper", "wandb",
         # train_whisper.py sets report_to=["tensorboard"]; without this the
         # Trainer raises before the first step
         "tensorboard",
@@ -202,6 +209,17 @@ _transcribe_secrets = (
     if os.environ.get("ENABLE_TRANSCRIBE") == "1"
     else []
 )
+
+# Unlike _transcribe_secrets, this one is NOT gated behind an env var: toggling
+# a function's secrets list on and off between `modal run` invocations of the
+# same ephemeral app hits a client/server object-graph mismatch ("Function has
+# N dependencies but container got N+1 object ids"), because Modal caches the
+# function's dependency graph across runs of the same app name. So the `wandb`
+# secret must exist (created once, below) and stays attached every run; train()
+# only reads it when --report-to includes wandb.
+#     modal secret create wandb WANDB_API_KEY=...
+#     modal run modal_app.py::train --report-to tensorboard wandb
+_wandb_secrets = [modal.Secret.from_name("wandb")]
 
 
 @app.function(
@@ -342,6 +360,7 @@ def build_val_dataset(out: str = f"{DATA}/val_domain"):
 @app.function(
     image=image,
     volumes={DATA: volume},
+    secrets=_wandb_secrets,
     gpu="A10G",
     timeout=6 * 3600,
 )
@@ -355,6 +374,9 @@ def train(
     eval_steps: int = 200,
     max_train_samples: int = 0,
     out: str = f"{DATA}/run1",
+    report_to: str = "tensorboard",
+    run_name: str = None,
+    wandb_project: str = "whisper-persian-finetune",
 ):
     """eval_steps and max_train_samples exist so the whole pipeline can be
     smoke-tested in minutes instead of hours.
@@ -364,6 +386,7 @@ def train(
     run that finishes without ever reaching an eval has no best checkpoint to
     load and fails at the very end -- after paying for all the training.
     """
+    report_to_list = [r.strip() for r in report_to.split(",") if r.strip()]
     cmd = ["python", f"{CODE}/train_whisper.py",
            "--dataset", dataset,
            "--out", out,
@@ -375,11 +398,16 @@ def train(
            # 128-256 clips track full-set WER closely enough to pick a checkpoint
            "--max-eval-samples", str(max_eval_samples),
            "--early-stopping-patience", str(early_stopping_patience),
-           "--progress", "never"]
+           "--progress", "never",
+           "--report-to", *report_to_list]
+    if run_name:
+        cmd += ["--run-name", run_name]
     if max_train_samples:
         cmd += ["--max-train-samples", str(max_train_samples)]
     if use_lora:
         cmd.append("--use-lora")
+    if "wandb" in report_to_list:
+        os.environ["WANDB_PROJECT"] = wandb_project
     _run(cmd)
     volume.commit()
 
@@ -570,9 +598,12 @@ def main(
     batch_size: int = 8,
     repos: str = DEFAULT_HF_REPOS,
     max_seconds_per_repo: float = 3600.0,
+    report_to: str = "tensorboard,wandb",
+    run_name: str = None,
 ):
     build_hf_dataset.remote(repos=repos, max_seconds_per_repo=max_seconds_per_repo)
-    train.remote(use_lora=use_lora, epochs=epochs, batch_size=batch_size)
+    train.remote(use_lora=use_lora, epochs=epochs, batch_size=batch_size,
+                 report_to=report_to, run_name=run_name)
     convert.remote()
     evaluate.remote()
 
