@@ -94,6 +94,17 @@ Scaling up (see [Scaling](#scaling) below):
 | `blend` | 4 CPU / 32GB | `/data/blend` |
 | `train_big` | A10G | `/data/run_big` |
 
+### Local entrypoints
+
+The pre-wired chains — `modal run --detach modal_app.py::<name>`:
+
+| Entrypoint | Chains | Use for |
+|---|---|---|
+| `main` | `build_hf_dataset → train → convert → evaluate` | the default run (public HF data only) |
+| `combined` | `build_hf_dataset → train (own + public, separate eval reports) → convert → evaluate ×2` | training on your own data too — see [Training on both at once](#training-on-both-at-once) |
+| `build_all` | six `build_one_repo` in parallel `→ blend` | phase 1 of scaling up, split out since `--detach` only survives the *last* triggered function |
+| `big` | `build_all`'s chain `→ train_big → convert → evaluate` | the full ~275h corpus in one call — see [Scaling](#scaling) |
+
 Useful flags:
 
 ```bash
@@ -125,6 +136,34 @@ path or a Hugging Face Hub repo id — see [Local / non-Modal use](#local--non-m
 - **Your own recordings**, pushed to the Hub with `push_to_hub.py` (see its
   module docstring) and passed straight to `train()`/`evaluate()` via
   `--dataset <repo id>` — e.g. `shervingh2000/behpardaz`.
+
+### Training on both at once
+
+```bash
+modal run --detach modal_app.py::combined
+```
+
+Concatenates your own dataset's train split onto the public HF build's, while
+validation tracking during training stays on your own dataset (the real
+target-domain data) — not a blend of both, so checkpoint selection and
+early stopping keep optimizing for the metric that actually matters. After
+training, it reports WER/CER **separately** for each validation set (own,
+then public), since a blended number isn't comparable run to run as either
+source's size changes.
+
+```bash
+# override the defaults
+modal run --detach modal_app.py::combined --own-dataset shervingh2000/behpardaz \
+    --max-seconds-per-repo 3600 --epochs 3
+```
+
+Calling `train()` directly gives the same building blocks individually:
+`--dataset` (what to train on), `--extra-dataset` (a second dataset whose
+train split gets concatenated on), `--eval-dataset` (which validation set to
+track live). Any of the three can be a local disk path or a Hub repo id, in
+any combination — see `train_whisper.py`'s `--extra-dataset` docstring for
+how heterogeneous sources (local filenames vs. Hub-embedded audio) get
+reconciled before concatenation.
 
 ### Data quality: `kouman`
 
@@ -274,10 +313,14 @@ push_to_hub (your own recordings) ───────┘      ↑
                           blend_datasets merges multiple local builds
 ```
 
-`train_whisper.py --dataset` and `--eval-dataset` each accept either a local
-disk path (a DatasetDict built by `hf_build_dataset.py`, with a sibling
-`clips/` folder) or a Hugging Face Hub dataset repo id (audio embedded, no
-clips dir needed) — e.g. `--dataset shervingh2000/behpardaz`.
+`train_whisper.py --dataset`, `--eval-dataset`, and `--extra-dataset` each
+accept either a local disk path (a DatasetDict built by `hf_build_dataset.py`,
+with a sibling `clips/` folder) or a Hugging Face Hub dataset repo id (audio
+embedded, no clips dir needed) — e.g. `--dataset shervingh2000/behpardaz`.
+`--extra-dataset` concatenates a second source's train split onto
+`--dataset`'s for training on both at once, while `--eval-dataset` still
+controls which single validation set gets tracked live (see
+[Training on both at once](#training-on-both-at-once)).
 
 Diagnostics: `report_run.py` (training curves), `peek_checkpoint.py` (mid-run
 sanity check), `diagnose_ct2.py` (inspect a converted model).
