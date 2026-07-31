@@ -1,16 +1,11 @@
 .DS_Store
-# Every pattern below is anchored to this file's directory (the repo root), so
-# it must carry the Whisper_Finetuning/ prefix -- the project lives one level
-# down. Without it these patterns match nothing at all, which is what let the
-# audio and run dirs stay un-ignored.
 # training outputs: checkpoints, adapters, tensorboard logs, merged CT2 dirs
-Whisper_Finetuning/finetune_persian/run*/
-Whisper_Finetuning/finetune_persian/models/
-Whisper_Finetuning/finetune_persian/base_model/
-Whisper_Finetuning/finetune_persian/__pycache__/
-Whisper_Finetuning/models/
-# node_modules anywhere in the repo (web app dependencies -- regenerable via npm install)
+finetune_persian/run*/
+finetune_persian/models/
+finetune_persian/base_model/
+finetune_persian/__pycache__/
+# node_modules anywhere in the repo (regenerable via npm install)
 **/node_modules/
 # hf_build_dataset.py's local output, if built outside Modal -- audio/dataset
 # bulk data, not reproducible-input source (the pushed Hub dataset is)
-Whisper_Finetuning/finetune_persian/sm_data/
+finetune_persian/sm_data/

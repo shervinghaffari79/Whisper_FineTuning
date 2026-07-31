@@ -85,8 +85,8 @@ def main():
                    or args.model.startswith(".") or Path(args.model).is_absolute())
     if looks_local and not Path(args.model).is_dir():
         sys.exit(f"model directory not found: {Path(args.model).resolve()}\n"
-                 f"CT2 models live next to asr_engine.py, not next to this script -- "
-                 f"from finetune_persian/ that is ../whiper/Whisper/models/<name>.\n"
+                 f"Pull it from the Modal volume first (see the README's Quick start):\n"
+                 f"  modal volume get whisper-persian-data models/whisper-persian-ct2-int8 ./models\n"
                  f"Pass a bare name like 'small' to pull from Hugging Face instead.")
 
     ds, is_hub = load_split(args.dataset, args.split)

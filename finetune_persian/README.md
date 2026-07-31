@@ -1,7 +1,8 @@
 # Persian Whisper fine-tuning on Modal
 
 Fine-tunes `AmirMohseni/whisper-large-v3-persian-bf16` with LoRA and converts the
-result to the CTranslate2 int8 format `asr_engine.py` serves in production.
+result to the CTranslate2 int8 format `asr_engine.py` serves in production --
+that app lives in its own repo, [STT_Persian](https://github.com/shervinghaffari79/STT_Persian).
 
 Everything runs on [Modal](https://modal.com) (serverless GPU). You need no local
 GPU, and no data on your machine — the pipeline pulls its audio from public
@@ -21,7 +22,7 @@ modal setup          # opens a browser to link your Modal account
 ```
 
 ```bash
-cd Whisper_Finetuning/finetune_persian
+cd finetune_persian
 modal run --detach modal_app.py
 ```
 

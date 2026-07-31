@@ -19,7 +19,7 @@ needed to tell that apart from "the model is simply bad at Persian":
      (identical output = the task token is being ignored)
 
 Usage:
-    python diagnose_ct2.py --model ../whiper/Whisper/models/whisper-large-v3-persian-ct2-int8
+    python diagnose_ct2.py --model ./models/whisper-large-v3-persian-ct2-int8
 """
 import argparse
 import json
