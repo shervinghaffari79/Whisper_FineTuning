@@ -244,7 +244,13 @@ def blend(out_root: str = f"{DATA}/full", out: str = f"{DATA}/blend"):
     volumes={DATA: volume},
     secrets=_wandb_secrets,
     gpu="A10G",
-    timeout=6 * 3600,
+    # 6h was sized for the original ~6k-clip public-only default. A combined
+    # own+public run (~21k clips, 3 epochs) needs ~7.6h of pure training alone
+    # (measured: reached step 3600/~3985 at 7.6s/step before the OLD 6h limit
+    # silently killed it -- Modal's function timeout is a hard kill, no
+    # exception, no trainer.save_model(), so it looks exactly like a crash).
+    # 16h leaves real margin without being close to train_big's 24h.
+    timeout=16 * 3600,
 )
 def train(
     use_lora: bool = True,
