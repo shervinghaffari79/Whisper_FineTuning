@@ -26,7 +26,7 @@ cd finetune_persian
 modal run --detach modal_app.py
 ```
 
-That runs the whole thing: build a ~12h dataset → LoRA fine-tune on an A10G →
+That runs the whole thing: build an up-to-~14h dataset → LoRA fine-tune on an A10G →
 merge and convert to CT2 → score WER. Expect **~6–7 hours**, most of it training
 (~5.6h train+eval on the A10G alone, at ~7.6 s/step).
 
@@ -142,6 +142,13 @@ path or a Hugging Face Hub repo id — see [Local / non-Modal use](#local--non-m
   validation split. The podcast repos are a single `train` split with no recording
   id, so they are tail-sliced — same speaker on both sides, which is weaker but is
   what is available without re-diarizing.
+
+- **FLEURS Farsi** —
+  [`MohammadGholizadeh/fleurs-farsi`](https://huggingface.co/datasets/MohammadGholizadeh/fleurs-farsi),
+  added as knowledge-heavy read speech with person/place names and explicit dates.
+  Only its `train` split is included in training; the official `dev` and `test`
+  splits remain untouched for independent evaluation. The dataset is licensed
+  under CC BY 4.0.
 
 - **Your own recordings**, pushed to the Hub with `push_to_hub.py` (see its
   module docstring) and passed straight to `train()`/`evaluate()` via
@@ -332,7 +339,7 @@ Rough shape of the reference run (check
 [Modal's pricing](https://modal.com/pricing) for current rates):
 
 - image build: ~80s, once, then cached
-- dataset build (12h audio): ~45–60 min on CPU
+- dataset build (up to ~14h audio): roughly 50–70 min on CPU
 - training: ~4.9h + ~0.7h eval overhead on one A10G
 - convert + evaluate: ~20–30 min
 

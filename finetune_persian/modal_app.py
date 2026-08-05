@@ -80,6 +80,9 @@ DEFAULT_HF_REPOS = ",".join([
     "MohammadGholizadeh/kouman_dataset_persian:sentence",
     "MohammadGholizadeh/bplus_podcast_persian:sentence",
     "MohammadGholizadeh/Tabaghe16_dataset_persian:sentence",
+    # Knowledge-heavy read speech with person/place names and explicit dates.
+    # Keep its official dev/test splits untouched for independent evaluation.
+    "MohammadGholizadeh/fleurs-farsi:transcription:train",
 ])
 
 volume = modal.Volume.from_name("whisper-persian-data", create_if_missing=True)
@@ -174,13 +177,17 @@ _wandb_secrets = [modal.Secret.from_name("wandb")]
 
 
 @app.function(image=image, volumes={DATA: volume}, cpu=8.0, timeout=6 * 3600)
-def build_hf_dataset(repos: str = DEFAULT_HF_REPOS, max_seconds_per_repo: float = 7200.0):
+def build_hf_dataset(
+    repos: str = DEFAULT_HF_REPOS,
+    max_seconds_per_repo: float = 7200.0,
+    out: str = f"{DATA}/collection",
+):
     """Build the training set by streaming the Hugging Face collection.
 
     Streams each repo and stops at the per-repo budget, so this never pulls the
     full 260GB the collection adds up to."""
     cmd = ["python", f"{CODE}/hf_build_dataset.py",
-           "--out", f"{DATA}/collection",
+           "--out", out,
            "--max-seconds-per-repo", str(max_seconds_per_repo)]
     for spec in [s.strip() for s in repos.split(",") if s.strip()]:
         cmd += ["--repo", spec]
@@ -382,14 +389,16 @@ def train_big(epochs: float = 1.0, batch_size: int = 8,
 # holds base + merged copies at once, so give it real memory rather than
 # discovering the OOM after training has already been paid for
 @app.function(image=image, volumes={DATA: volume}, cpu=4.0, memory=32768, timeout=3600)
-def convert():
-    # --force so the stage is re-runnable: the converter refuses to write into an
-    # existing output dir, which otherwise makes every convert after the first
-    # one fail -- and it fails AFTER redoing the LoRA merge. The output is
-    # regenerable from run1/final, so overwriting is the right default here.
+def convert(
+    source_run: str = f"{DATA}/run1/final",
+    model_out: str = f"{DATA}/models/whisper-persian-ct2-int8",
+):
+    # --force makes conversion re-runnable. Callers can select a new source
+    # run and output directory so an experimental model never overwrites a
+    # previously shipped CT2 artifact.
     cmd = ["python", f"{CODE}/convert_to_ct2.py",
-           f"{DATA}/run1/final",
-           f"{DATA}/models/whisper-persian-ct2-int8",
+           source_run,
+           model_out,
            "--force"]
     _run(cmd)
     volume.commit()
@@ -402,9 +411,13 @@ def convert():
 # full 959-clip held-out set needs ~32 min and the old cap killed it at 850 --
 # after 28 minutes of GPU time, with no report written.
 @app.function(image=gpu_image, volumes={DATA: volume}, gpu="T4", timeout=2 * 3600)
-def evaluate(dataset: str = f"{DATA}/collection/hf_dataset", limit: int = 500):
+def evaluate(
+    dataset: str = f"{DATA}/collection/hf_dataset",
+    limit: int = 500,
+    model: str = f"{DATA}/models/whisper-persian-ct2-int8",
+):
     cmd = ["python", f"{CODE}/eval_baseline.py",
-           "--model", f"{DATA}/models/whisper-persian-ct2-int8",
+           "--model", model,
            "--dataset", dataset,
            "--split", "validation",
            "--limit", str(limit)]
@@ -579,7 +592,7 @@ def combined(
     rather than a blended number, since a blend isn't comparable run to run as
     either source's size changes.
 
-    max_seconds_per_repo (default 7200 = 2h/repo, ~12h/~12k clips total) is
+    max_seconds_per_repo (default 7200 = 2h/repo, up to ~14h total) is
     the "budget-friendly" default -- see the README's Scaling section to go
     bigger, or modal run --detach modal_app.py::big for the full ~275h corpus.
     """

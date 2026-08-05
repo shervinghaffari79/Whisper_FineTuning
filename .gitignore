@@ -1,4 +1,6 @@
 .DS_Store
+.agents/
+.venv/
 # training outputs: checkpoints, adapters, tensorboard logs, merged CT2 dirs
 finetune_persian/run*/
 finetune_persian/models/

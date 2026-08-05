@@ -29,10 +29,16 @@ from pathlib import Path
 import soundfile as sf
 from datasets import load_from_disk
 
+from model_paths import default_ct2_model_dir
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--model",
+        default=default_ct2_model_dir(),
+        help="CTranslate2 model directory (default: CT2_MODEL_DIR, then the project-local model)",
+    )
     parser.add_argument("--dataset", default="./sm_data/dataset/hf_dataset")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--clips-dir", default=None)
