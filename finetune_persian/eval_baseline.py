@@ -36,6 +36,7 @@ from datasets import Audio, load_dataset, load_from_disk
 # train_whisper.compute_metrics so the in-training number and this one are
 # measuring the same thing -- see fa_text.py.
 from fa_text import normalize_for_wer as normalize_fa
+from model_paths import default_ct2_model_dir
 
 
 def load_split(spec: str, split: str):
@@ -52,7 +53,11 @@ def load_split(spec: str, split: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="CTranslate2 model directory")
+    parser.add_argument(
+        "--model",
+        default=default_ct2_model_dir(),
+        help="CTranslate2 model directory (default: CT2_MODEL_DIR, then the project-local model)",
+    )
     parser.add_argument("--dataset", default="./sm_data/dataset/hf_dataset")
     parser.add_argument("--split", default="validation")
     parser.add_argument("--clips-dir", default=None)
